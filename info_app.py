@@ -455,6 +455,7 @@ class mainWindow(QMainWindow, main_window):
         self.lineEdit_8.setEnabled(False)
         self.comboBox_10.currentIndexChanged.connect(self.comboBox_10_changed)
         self.comboBox.currentIndexChanged.connect(self.fit_curve_model)
+        self.result = None
         self.file_path = None
         self.img_directory = None
         self.download_directory = None
@@ -516,8 +517,6 @@ class mainWindow(QMainWindow, main_window):
         self.comboBox_5.currentTextChanged.connect(self.change_time_unit)
         self.comboBox_6.currentTextChanged.connect(self.change_time_unit)
         self.comboBox_7.currentTextChanged.connect(self.change_time_unit)
-        self.comboBox_11.currentTextChanged.connect(self.change_time_unit)
-
 
         # 寿命、温度计算
         self.comboBox.currentTextChanged.connect(self.calculate_decay)   
@@ -552,7 +551,6 @@ class mainWindow(QMainWindow, main_window):
         self.lineEdit_22.editingFinished.connect(self.calculate_decay)
         self.lineEdit_23.editingFinished.connect(self.calculate_decay)
         self.lineEdit_24.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_25.editingFinished.connect(self.calculate_decay)
         
     def change_time_unit(self):
         unit_mapping = {'s':1, 'ms':1000, 'μs':1000000, 'ns':1000000000}
@@ -560,18 +558,16 @@ class mainWindow(QMainWindow, main_window):
         text_5 = self.comboBox_5.currentText()
         text_6 = self.comboBox_6.currentText()
         text_7 = self.comboBox_7.currentText()
-        text_11 = self.comboBox_11.currentText()
         self.time_unit_5 = unit_mapping[text_5]
         self.time_unit_6 = unit_mapping[text_6]
         self.time_unit_7 = unit_mapping[text_7]
-        self.time_unit_11 = unit_mapping[text_11]
     
     def fit_curve_model(self):
         text = self.comboBox.currentText()
         if text == '双指数':
-            self.label_21.setText('I(t) = Aexp(-t/τ1) + Bexp(-t/τ2) + C')
+            self.label_21.setText('I(t) = A1exp(-t/τ1) + A2exp(-t/τ2) + I0')
         if text == '单指数':
-            self.label_21.setText('I(t) = I0 exp(-t/τ) + C')
+            self.label_21.setText('I(t) = Aexp(-t/τ) + I0')
 
 
     def comboBox_10_changed(self):
@@ -898,7 +894,105 @@ class mainWindow(QMainWindow, main_window):
             print(f"加载文件 {file_path} 出错: {str(e)}")
             traceback.print_exc()
             return False
+        
+    def _load_file_manually(self, file_path, column1, column2, data_start_row):
+        """手动解析文件，处理各种数据格式问题"""
+        try:
+            valid_data = []
+            
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            
+            start_processing = False
+            line_count = 0
+            
+            for line in lines:
+                line_count += 1
+                
+                # 如果指定了起始行，检查是否到达起始行
+                if data_start_row is not None:
+                    if line_count <= data_start_row:
+                        continue
+                    start_processing = True
+                else:
+                    # 自动模式：检查是否是数据行
+                    if not start_processing:
+                        if self._is_data_line(line, column1, column2):
+                            start_processing = True
+                        else:
+                            continue
+                
+                if start_processing:
+                    # 处理数据行
+                    processed_line = self._process_data_line(line, column1, column2)
+                    if processed_line is not None:
+                        valid_data.append(processed_line)
+            
+            if not valid_data:
+                print(f"文件 {file_path} 中没有找到有效数据")
+                return False
+            
+            # 转换为numpy数组
+            data = np.array(valid_data)
+            self.file_data_cache[file_path] = data
+            return True
+            
+        except Exception as e:
+            print(f"手动解析文件 {file_path} 出错: {str(e)}")
+            return False
 
+    def _is_data_line(self, line, column1, column2):
+        """检查行是否是有效的数据行"""
+        line = line.strip()
+        if not line:
+            return False
+        
+        parts = line.split(',')
+        if len(parts) <= max(column1, column2):
+            return False
+        
+        try:
+            # 尝试转换两个列的值
+            val1 = parts[column1].strip()
+            val2 = parts[column2].strip()
+            
+            # 检查是否为空字符串
+            if not val1 or not val2:
+                return False
+            
+            float(val1)
+            float(val2)
+            return True
+            
+        except (ValueError, IndexError):
+            return False
+
+    def _process_data_line(self, line, column1, column2):
+        """处理单行数据，返回[x, y]或None"""
+        line = line.strip()
+        if not line:
+            return None
+        
+        parts = line.split(',')
+        if len(parts) <= max(column1, column2):
+            return None
+        
+        try:
+            val1 = parts[column1].strip()
+            val2 = parts[column2].strip()
+            
+            # 跳过空值
+            if not val1 or not val2:
+                return None
+            
+            x_val = float(val1)
+            y_val = float(val2)
+            
+            return [x_val, y_val]
+            
+        except (ValueError, IndexError):
+            return None
+        
     def click_file(self, item):
         """点击treeWidget中的文件时触发"""
         file_path = item.data(0, QtCore.Qt.UserRole)
@@ -1056,14 +1150,13 @@ class mainWindow(QMainWindow, main_window):
         x, y_data = self.data_range(Origional_x, Origional_y_data)
         result = fitter.fit_curve(x, y_data, models_to_test)
 
+        self.result = result
 
         if models_to_test == '单指数':
             # 获取系数b (对应衰减速率)
             b = result.params[1]  # 参数顺序是[a, b, c]            
             # 计算寿命τ (τ = -1/b)
             lifetime = -1/b if b != 0 else float('inf')
-            print(f"文件: {os.path.basename(self.file_path)}")
-            print(f"寿命τ: {lifetime}")
             self.lifetime = lifetime
             
             # 在界面上显示
@@ -1078,8 +1171,23 @@ class mainWindow(QMainWindow, main_window):
             tau2 = -1/d if d != 0 else float('inf')
             
             # 在界面上显示
-            self.lineEdit.setText(f"τ1: {tau1:.8f}, τ2: {tau2:.8f}")
-
+            self.lineEdit_27.setText(f"{result.params[0]:.5f}")
+            self.lineEdit.setText(f"{tau1:.5f}")
+            self.lineEdit_26.setText(f"{result.params[2]:.5f}")
+            self.lineEdit_28.setText(f"{tau2:.5f}")
+            self.lineEdit_29.setText(f"{result.params[4]:.5f}")            
+            
+        self.lineEdit_30.setText(f"{result.sse:.5f}")
+        self.lineEdit_7.setText(f"{result.rsquare:.5f}")
+        self.lineEdit_31.setText(f"{result.adjrsquare:.5f}")
+        self.lineEdit_32.setText(f"{result.rmse:.5f}")
+        self.lineEdit_33.setText(f"{'是' if result.success else '否'}")
+        
+        y_pred = fitter._get_model_definition(models_to_test)['function'](x, *result.params)
+        self.fig1fig2_plot(Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test)
+        print(result)
+    
+    def fig1fig2_plot(self, Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test):
         # 绘制图形
         self.figure2.clear()
         ax2 = self.figure2.add_subplot(111)
@@ -1089,7 +1197,6 @@ class mainWindow(QMainWindow, main_window):
         # 高亮显示用于拟合的数据点
         ax2.scatter(x, y_data, alpha=0.8, color='blue', s=10)
         
-        y_pred = fitter._get_model_definition(models_to_test)['function'](x, *result.params)
         ax2.plot(x, y_pred, 'r-', label=f'{models_to_test}拟合', linewidth=2)
         ax2.legend()
         ax2.set_title(f'{models_to_test}模型拟合结果')
@@ -1099,14 +1206,14 @@ class mainWindow(QMainWindow, main_window):
         # 绘制残差
         self.figure3.clear()
         ax3 = self.figure3.add_subplot(111)
-        ax3.plot(x, result.residuals, 'ro-', alpha=0.6, markersize=2)
+        ax3.plot(x, self.result.residuals, 'ro-', alpha=0.6, markersize=2)
         ax3.axhline(y=0, color='k', linestyle='--')
         ax3.set_title('残差图')
         ax3.set_xlabel('x')
         ax3.set_ylabel('残差')
         ax3.grid(True, alpha=0.3)
         self.canvas3.draw()
-        # self.calculate_lifetime()
+
     
     def calculate_lifetime(self):
         """使用线性外推方法计算温度"""
