@@ -450,7 +450,6 @@ class mainWindow(QMainWindow, main_window):
         
         self.setup_matplotlib_chinese()
 
-        self.treeWidget.itemClicked.connect(self.click_file)
         self.treeWidget.itemClicked.connect(self.calculate_decay)
         self.lineEdit_8.setEnabled(False)
         self.comboBox_10.currentIndexChanged.connect(self.comboBox_10_changed)
@@ -831,25 +830,25 @@ class mainWindow(QMainWindow, main_window):
         
         
     def load_file_data(self, file_path):
-        """加载文件数据到缓存，处理空字符串和格式问题"""
+        """加载文件数据到缓存，确保数据为数值类型"""
         try:
             column1 = int(self.lineEdit_9.text()) - 1
             column2 = int(self.lineEdit_10.text()) - 1
             
             if self.comboBox_10.currentText() == '自动':
                 if file_path.lower().endswith(('.txt', '.csv')):
-                    # 方法1: 使用pandas读取，自动处理空值
                     try:
-                        df = pd.read_csv(file_path, header=None)
+                        # 使用pandas读取，指定数据类型为数值
+                        df = pd.read_csv(file_path, header=None, dtype=str)  # 先读为字符串
                         
                         # 查找数据开始行
                         data_start_row = 0
                         for i in range(len(df)):
                             try:
-                                # 检查该行是否包含数值数据
                                 val1 = df.iloc[i, column1]
                                 val2 = df.iloc[i, column2]
-                                if pd.notna(val1) and pd.notna(val2):
+                                if pd.notna(val1) and pd.notna(val2) and val1.strip() and val2.strip():
+                                    # 尝试转换为浮点数
                                     float(val1)
                                     float(val2)
                                     data_start_row = i
@@ -857,36 +856,58 @@ class mainWindow(QMainWindow, main_window):
                             except (ValueError, TypeError):
                                 continue
                         
-                        # 读取数据
+                        # 重新读取数据并转换为数值
                         data = pd.read_csv(file_path, header=None, skiprows=data_start_row, 
-                                        usecols=[column1, column2])
+                                        usecols=[column1, column2], dtype=str)
                         
-                        # 清理数据：移除包含NaN或空值的行
+                        # 清理数据：移除空值并转换为数值
+                        data = data.dropna()
+                        
+                        # 转换为数值类型，无法转换的设为NaN
+                        data = data.apply(pd.to_numeric, errors='coerce')
+                        
+                        # 移除包含NaN的行
                         data = data.dropna()
                         
                         # 转换为numpy数组
                         data = data.values
+                        
+                        print(f"加载数据形状: {data.shape}, 数据类型: {data.dtype}")
+                        
                         self.file_data_cache[file_path] = data
                         return True
                         
                     except Exception as e:
                         print(f"Pandas读取失败，尝试手动解析: {e}")
-                        # 方法2: 手动解析文件
                         return self._load_file_manually(file_path, column1, column2, None)
                 
                 elif file_path.lower().endswith(('.xlsx', '.xls')):
-                    data = pd.read_excel(file_path).values
-                    self.file_data_cache[file_path] = data
-                    return True
+                    try:
+                        data = pd.read_excel(file_path).iloc[:, [column1, column2]]
+                        data = data.apply(pd.to_numeric, errors='coerce')
+                        data = data.dropna()
+                        data = data.values
+                        self.file_data_cache[file_path] = data
+                        return True
+                    except Exception as e:
+                        print(f"Excel读取失败: {e}")
+                        return False
             
             elif self.comboBox_10.currentText() == '行':
                 data_start_row = int(self.lineEdit_8.text()) - 1
                 if file_path.lower().endswith(('.txt', '.csv')):
                     return self._load_file_manually(file_path, column1, column2, data_start_row)
                 elif file_path.lower().endswith(('.xlsx', '.xls')):
-                    data = pd.read_excel(file_path, skiprows=data_start_row).values
-                    self.file_data_cache[file_path] = data
-                    return True
+                    try:
+                        data = pd.read_excel(file_path, skiprows=data_start_row).iloc[:, [column1, column2]]
+                        data = data.apply(pd.to_numeric, errors='coerce')
+                        data = data.dropna()
+                        data = data.values
+                        self.file_data_cache[file_path] = data
+                        return True
+                    except Exception as e:
+                        print(f"Excel读取失败: {e}")
+                        return False
             
             return False
             
@@ -894,9 +915,9 @@ class mainWindow(QMainWindow, main_window):
             print(f"加载文件 {file_path} 出错: {str(e)}")
             traceback.print_exc()
             return False
-        
+         
     def _load_file_manually(self, file_path, column1, column2, data_start_row):
-        """手动解析文件，处理各种数据格式问题"""
+        """手动解析文件，确保数据类型正确"""
         try:
             valid_data = []
             
@@ -932,8 +953,10 @@ class mainWindow(QMainWindow, main_window):
                 print(f"文件 {file_path} 中没有找到有效数据")
                 return False
             
-            # 转换为numpy数组
-            data = np.array(valid_data)
+            # 转换为numpy数组并确保为浮点类型
+            data = np.array(valid_data, dtype=float)
+            print(f"手动加载数据形状: {data.shape}, 数据类型: {data.dtype}")
+            
             self.file_data_cache[file_path] = data
             return True
             
@@ -968,82 +991,45 @@ class mainWindow(QMainWindow, main_window):
             return False
 
     def _process_data_line(self, line, column1, column2):
-        """处理单行数据，返回[x, y]或None"""
+        """处理单行数据，返回[x, y]或None，确保数值类型"""
         line = line.strip()
         if not line:
             return None
         
-        parts = line.split(',')
-        if len(parts) <= max(column1, column2):
+        # 支持多种分隔符：逗号、制表符、空格
+        separators = [',', '\t', ' ']
+        parts = None
+        
+        for sep in separators:
+            temp_parts = line.split(sep)
+            if len(temp_parts) > max(column1, column2):
+                parts = [p.strip() for p in temp_parts if p.strip()]  # 移除空字符串
+                break
+        
+        if parts is None or len(parts) <= max(column1, column2):
             return None
         
         try:
-            val1 = parts[column1].strip()
-            val2 = parts[column2].strip()
+            val1 = parts[column1]
+            val2 = parts[column2]
             
             # 跳过空值
             if not val1 or not val2:
                 return None
+            
+            # 移除可能的引号或其他非数字字符
+            val1 = val1.replace('"', '').replace("'", "").strip()
+            val2 = val2.replace('"', '').replace("'", "").strip()
             
             x_val = float(val1)
             y_val = float(val2)
             
             return [x_val, y_val]
             
-        except (ValueError, IndexError):
+        except (ValueError, IndexError) as e:
+            # 打印无法转换的值以便调试
+            print(f"无法转换的数据: '{parts[column1]}', '{parts[column2]}' - 错误: {e}")
             return None
-        
-    def click_file(self, item):
-        """点击treeWidget中的文件时触发"""
-        file_path = item.data(0, QtCore.Qt.UserRole)
-        self.file_path = file_path
-
-        if file_path not in self.file_data_cache:
-            if not self.load_file_data(file_path):
-                QMessageBox.warning(self, "错误", f"无法加载文件数据: {os.path.basename(file_path)}")
-                return
-        
-        data = self.file_data_cache[file_path]
-        
-        try:
-            if len(data.shape) == 1 or data.shape[1] < 2:
-                raise ValueError("数据列数不足，无法绘制图形")
-            
-            t_data = data[:, 0]  # 第一列作为x轴数据
-            y_data = data[:, 1]  # 第二列作为y轴数据
-            
-            if len(t_data) != len(y_data):
-                raise ValueError("x轴和y轴数据长度不一致")
-            
-            # 绘制图形
-            self.figure.clear()
-            self.figure2.clear()
-            self.figure3.clear()
-            self.canvas2.draw()
-            self.canvas3.draw()
-
-            ax = self.figure.add_subplot(111)
-            
-            # 获取comboBox当前文本作为x轴标签
-            x_label = self.comboBox_7.currentText() if self.comboBox.currentText() else "X轴"
-            
-            ax.plot(t_data, y_data, 'b-')
-            ax.set_xlabel(f'时间/{x_label}')
-            ax.set_ylabel("相对强度")
-            ax.set_title(os.path.basename(file_path))
-            
-            # 自动调整坐标轴范围
-            ax.relim()
-            ax.autoscale_view()
-            
-            # 添加网格线
-            ax.grid(True)
-            
-            self.canvas.draw()
-            
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"绘图时出错: {str(e)}")
-            traceback.print_exc()
 
     def closeEvent(self, event):
         """重写关闭事件，保存当前设置"""
@@ -1083,113 +1069,207 @@ class mainWindow(QMainWindow, main_window):
 
         return x_filtered, y_filtered
 
-    def calculate_decay(self):
-                
+    def calculate_decay(self, item=None):
+        """计算衰减参数 - 支持有参数和无参数调用"""
         try:
-            if self.file_path not in self.file_data_cache:
-                QMessageBox.warning(self, "错误", f"请选择一份文件")
-                return False
+            # 如果没有传递item参数，使用当前选中的项目
+            if item is None:
+                current_item = self.treeWidget.currentItem()
+                if current_item is None:
+                    # 如果没有选中的项目，尝试使用第一个项目
+                    if self.treeWidget.topLevelItemCount() > 0:
+                        current_item = self.treeWidget.topLevelItem(0)
+                    else:
+                        QMessageBox.warning(self, "警告", "没有可处理的文件")
+                        return
+                file_path = current_item.data(0, QtCore.Qt.UserRole)
+            else:
+                file_path = item.data(0, QtCore.Qt.UserRole)
             
-            if not self.load_file_data(self.file_path):
-                QMessageBox.warning(self, "错误", f"无法加载文件数据: {os.path.basename(self.file_path)}")
-                return False
+            print(f"处理文件: {file_path}")
+            
+            self.file_path = file_path
+
+            # 清理之前的图形和状态
+            self.figure.clear()
+            self.figure2.clear()
+            self.figure3.clear()
+            
+            # 重置相关变量
+            self.result = None
+            self.lifetime = None
+
+            # 强制重新加载文件数据，避免缓存问题
+            if file_path in self.file_data_cache:
+                del self.file_data_cache[file_path]
                 
-            data = self.file_data_cache[self.file_path]
+            if not self.load_file_data(file_path):
+                QMessageBox.warning(self, "错误", f"无法加载文件数据: {os.path.basename(file_path)}")
+                return
+            
+            data = self.file_data_cache[file_path]
+            print(f"数据形状: {data.shape}, 数据类型: {data.dtype}")
+            
+            # 数据验证
+            if len(data.shape) != 2 or data.shape[1] < 2:
+                QMessageBox.warning(self, "错误", f"数据格式不正确，期望至少2列，实际形状: {data.shape}")
+                return
+            
+            if len(data) == 0:
+                QMessageBox.warning(self, "错误", "文件为空或没有有效数据")
+                return
+            
+            # 确保数据为数值类型
+            if data.dtype.kind not in 'buifc':  # 检查是否为数值类型
+                data = data.astype(float)
+            
+            t_data = data[:, 0]  # 第一列作为x轴数据
+            y_data = data[:, 1]  # 第二列作为y轴数据
+            
+            # 安全的打印语句
+            try:
+                print(f"数据范围 - x: [{np.min(t_data):.3f}, {np.max(t_data):.3f}], y: [{np.min(y_data):.3f}, {np.max(y_data):.3f}]")
+            except:
+                print(f"数据范围 - x: [{np.min(t_data)}, {np.max(t_data)}], y: [{np.min(y_data)}, {np.max(y_data)}]")
+            
+            # 绘制原始数据图形
+            ax = self.figure.add_subplot(111)
+            x_label = self.comboBox_7.currentText() if self.comboBox.currentText() else "X轴"
+            
+            ax.plot(t_data, y_data, 'b-', linewidth=1)
+            ax.set_xlabel(f'时间/{x_label}')
+            ax.set_ylabel("相对强度")
+            ax.set_title(f'原始数据 - {os.path.basename(file_path)}')
+            ax.grid(True)
+            
+            self.canvas.draw()
+            
+            # 进行拟合计算
+            self._perform_fitting(data, file_path)
+            
         except Exception as e:
+            error_msg = f"处理文件时出错: {str(e)}"
+            print(error_msg)
             traceback.print_exc()
-            return False
-                
+            QMessageBox.critical(self, "错误", error_msg)
+
+    def _perform_fitting(self, data, file_path):
+        """执行拟合计算的内部方法"""
         try:
-            if len(data.shape) == 1 or data.shape[1] < 2:
-                raise ValueError("数据列数不足，无法绘制图形")
+            Origional_x = data[:, 0]
+            Origional_y_data = data[:, 1]
             
-            Origional_x = data[:, 0]  # 第一列作为x轴数据
-            Origional_y_data = data[:, 1]  # 第二列作为y轴数据
+            # 创建新的拟合器实例，避免状态污染
+            fitter = MATLABCurveFitter()
+
+            # 配置拟合选项
+            robust_mapping = {
+                'Off': RobustMethod.OFF,
+                'LAR': RobustMethod.LAR,
+                'Bisquare': RobustMethod.BISQUARE
+            }
+
+            algorithm_mapping = {
+                'Levenberg-Marquardt': Algorithm.LEVENBERG_MARQUARDT,
+                'Trust-Region': Algorithm.TRUST_REGION,
+            }
+
+            robust_choice = self.comboBox_8.currentText()
+            robust_method = robust_mapping.get(robust_choice, RobustMethod.OFF)
+
+            algorithm_choice = self.comboBox_9.currentText()
+            algorithm_method = algorithm_mapping.get(algorithm_choice, Algorithm.LEVENBERG_MARQUARDT)
+
+            # 设置高级选项（添加错误处理）
+            try:
+                fitter.set_options(
+                    Robust=robust_method,
+                    Algorithm=algorithm_method,
+                    DiffMinChange=float(self.lineEdit_19.text() or "1e-8"),
+                    DiffMaxChange=float(self.lineEdit_20.text() or "0.1"),
+                    MaxIter=int(self.lineEdit_21.text() or "400"),
+                    MaxFunEvals=int(self.lineEdit_22.text() or "600"),
+                    TolFun=float(self.lineEdit_23.text() or "1e-6"),
+                    TolX=float(self.lineEdit_24.text() or "1e-6")
+                )
+            except ValueError as e:
+                print(f"拟合参数设置错误，使用默认值: {e}")
+                # 使用默认值继续
+
+            # 获取模型类型
+            models_to_test = self.comboBox.currentText()
+            print(f"使用模型: {models_to_test}")
+
+            # 数据范围筛选
+            x, y_data = self.data_range(Origional_x, Origional_y_data)
+            print(f"筛选后数据点数: {len(x)}")
+            
+            if len(x) < 2:
+                QMessageBox.warning(self, "警告", "筛选后的数据点不足，无法进行拟合")
+                return
+
+            # 执行拟合
+            result = fitter.fit_curve(x, y_data, models_to_test)
+            self.result = result
+
+            # 处理拟合结果
+            if result.success:
+                self._handle_fit_result(result, models_to_test, Origional_x, Origional_y_data, x, y_data, fitter)
+            else:
+                QMessageBox.warning(self, "警告", f"拟合失败: {result.message}")
+                
         except Exception as e:
-            print(f"加载文件 {self.file_path} 出错: {str(e)}")
+            error_msg = f"拟合计算时出错: {str(e)}"
+            print(error_msg)
             traceback.print_exc()
-            return False
-        
-        # 创建拟合器
-        fitter = MATLABCurveFitter()
+            QMessageBox.critical(self, "错误", error_msg)
 
-        robust_mapping = {
-        'Off': RobustMethod.OFF,
-        'LAR': RobustMethod.LAR,
-        'Bisquare': RobustMethod.BISQUARE
-        }
+    def _handle_fit_result(self, result, models_to_test, Origional_x, Origional_y_data, x, y_data, fitter):
+        """处理拟合结果"""
+        try:
+            if models_to_test == '单指数':
+                b = result.params[1]
+                lifetime = -1/b if b != 0 else float('inf')
+                self.lifetime = lifetime
+                self.lineEdit.setText(f"{lifetime:.8f}")
+                print(f"单指数拟合结果: lifetime = {lifetime:.6f}")
 
-        # 获取当前选择的 robust 方法
-        robust_choice = self.comboBox_8.currentText()
-        robust_method = robust_mapping.get(robust_choice, RobustMethod.OFF)  # 默认使用 OFF
+            elif models_to_test == '双指数':
+                b = result.params[1]
+                d = result.params[3]
+                tau1 = -1/b if b != 0 else float('inf')
+                tau2 = -1/d if d != 0 else float('inf')
+                
+                self.lineEdit_27.setText(f"{result.params[0]:.10f}")
+                self.lineEdit.setText(f"{tau1:.10f}")
+                self.lineEdit_26.setText(f"{result.params[2]:.10f}")
+                self.lineEdit_28.setText(f"{tau2:.10f}")
+                self.lineEdit_29.setText(f"{result.params[4]:.10f}")
+                
+                print(f"双指数拟合结果: tau1 = {tau1:.10f}, tau2 = {tau2:.10f}")
 
-        algorithm_mapping = {
-        'Levenberg-Marquardt': Algorithm.LEVENBERG_MARQUARDT,
-        'Trust-Region': Algorithm.TRUST_REGION,
-        }
+            # 更新统计信息
+            self.lineEdit_30.setText(f"{result.sse:.10f}")
+            self.lineEdit_7.setText(f"{result.rsquare:.10f}")
+            self.lineEdit_31.setText(f"{result.adjrsquare:.10f}")
+            self.lineEdit_32.setText(f"{result.rmse:.10f}")
+            self.lineEdit_33.setText(f"{'是' if result.success else '否'}")
 
-        # 获取当前选择的 robust 方法
-        algorithm_choice = self.comboBox_9.currentText()
-        algorithm_method = algorithm_mapping.get(algorithm_choice, Algorithm.LEVENBERG_MARQUARDT)  # 默认使用 OFF
-
-        # 设置高级选项
-        fitter.set_options(
-            Robust=robust_method,
-            Algorithm=algorithm_method,
-            DiffMinChange = float(self.lineEdit_19.text()),
-            DiffMaxChange = float(self.lineEdit_20.text()),
-            MaxIter = int(self.lineEdit_21.text()),
-            MaxFunEvals = int(self.lineEdit_22.text()),
-            TolFun = float(self.lineEdit_23.text()),
-            TolX = float(self.lineEdit_24.text())
-        )
-
-        # 测试不同模型
-        models_to_test = self.comboBox.currentText()
-
-        x, y_data = self.data_range(Origional_x, Origional_y_data)
-        result = fitter.fit_curve(x, y_data, models_to_test)
-
-        self.result = result
-
-        if models_to_test == '单指数':
-            # 获取系数b (对应衰减速率)
-            b = result.params[1]  # 参数顺序是[a, b, c]            
-            # 计算寿命τ (τ = -1/b)
-            lifetime = -1/b if b != 0 else float('inf')
-            self.lifetime = lifetime
+            # 绘制结果
+            model_def = fitter._get_model_definition(models_to_test)
+            if model_def:
+                y_pred = model_def['function'](x, *result.params)
+                self.fig1fig2_plot(Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test)
             
-            # 在界面上显示
-            self.lineEdit.setText(f"{lifetime:.8f}")
+            print("拟合完成:", result)
+            
+        except Exception as e:
+            error_msg = f"处理拟合结果时出错: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
 
-        elif models_to_test == '双指数':
-            # 获取系数b和d (对应两个衰减速率)
-            b = result.params[1]  # 第一个衰减速率
-            d = result.params[3]  # 第二个衰减速率            
-            # 计算两个寿命
-            tau1 = -1/b if b != 0 else float('inf')
-            tau2 = -1/d if d != 0 else float('inf')
-            
-            # 在界面上显示
-            self.lineEdit_27.setText(f"{result.params[0]:.5f}")
-            self.lineEdit.setText(f"{tau1:.5f}")
-            self.lineEdit_26.setText(f"{result.params[2]:.5f}")
-            self.lineEdit_28.setText(f"{tau2:.5f}")
-            self.lineEdit_29.setText(f"{result.params[4]:.5f}")            
-            
-        self.lineEdit_30.setText(f"{result.sse:.5f}")
-        self.lineEdit_7.setText(f"{result.rsquare:.5f}")
-        self.lineEdit_31.setText(f"{result.adjrsquare:.5f}")
-        self.lineEdit_32.setText(f"{result.rmse:.5f}")
-        self.lineEdit_33.setText(f"{'是' if result.success else '否'}")
-        
-        y_pred = fitter._get_model_definition(models_to_test)['function'](x, *result.params)
-        self.fig1fig2_plot(Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test)
-        print(result)
-    
     def fig1fig2_plot(self, Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test):
         # 绘制图形
-        self.figure2.clear()
         ax2 = self.figure2.add_subplot(111)
 
         # 绘制所有数据点
@@ -1204,7 +1284,6 @@ class mainWindow(QMainWindow, main_window):
         self.canvas2.draw()
 
         # 绘制残差
-        self.figure3.clear()
         ax3 = self.figure3.add_subplot(111)
         ax3.plot(x, self.result.residuals, 'ro-', alpha=0.6, markersize=2)
         ax3.axhline(y=0, color='k', linestyle='--')
