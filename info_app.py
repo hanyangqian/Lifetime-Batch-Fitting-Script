@@ -32,6 +32,8 @@ import warnings
 from enum import Enum
 import inspect
 
+
+
 class RobustMethod(Enum):
     OFF = 'Off'
     LAR = 'LAR'
@@ -512,44 +514,41 @@ class mainWindow(QMainWindow, main_window):
         # 恢复上一次的设置
         self.restore_previous_settings()
         
+        # 数据筛选
+        self.lineEdit_3.setEnabled(True)
+        self.lineEdit_4.setEnabled(False)
+
+        self.comboBox_3.currentTextChanged.connect(self.change_range)
+        self.comboBox_4.currentTextChanged.connect(self.change_range)
+        
         # 单位设置
         self.comboBox_5.currentTextChanged.connect(self.change_time_unit)
         self.comboBox_6.currentTextChanged.connect(self.change_time_unit)
         self.comboBox_7.currentTextChanged.connect(self.change_time_unit)
 
+        
+        
         # 寿命、温度计算
-        self.comboBox.currentTextChanged.connect(self.calculate_decay)   
-        self.comboBox_2.currentTextChanged.connect(self.calculate_decay)   
-        self.comboBox_3.currentTextChanged.connect(self.calculate_decay)
-        self.comboBox_4.currentTextChanged.connect(self.calculate_decay)        
-        self.comboBox_5.currentTextChanged.connect(self.calculate_decay)
-        self.comboBox_6.currentTextChanged.connect(self.calculate_decay)
-        self.comboBox_7.currentTextChanged.connect(self.calculate_decay)
-        self.comboBox_8.currentTextChanged.connect(self.calculate_decay)
-        self.comboBox_9.currentTextChanged.connect(self.calculate_decay)
-        self.comboBox_10.currentTextChanged.connect(self.calculate_decay)
-        self.lineEdit_2.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_3.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_4.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_5.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_6.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_8.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_9.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_10.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_11.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_12.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_13.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_14.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_15.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_16.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_17.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_18.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_19.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_20.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_21.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_22.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_23.editingFinished.connect(self.calculate_decay)
-        self.lineEdit_24.editingFinished.connect(self.calculate_decay)
+        self.pushButton_6.clicked.connect(self.calculate_decay)   
+
+    def change_range(self):
+        comboBox_3 = self.comboBox_3.currentText()
+        comboBox_4 = self.comboBox_4.currentText()
+        if comboBox_3 == '最小值':
+            self.lineEdit_3.setText(self.comboBox_3.currentText())
+            self.lineEdit_3.setEnabled(False)
+        else:
+            self.lineEdit_3.setText('')
+            self.lineEdit_3.setEnabled(True)
+        if comboBox_4 == '最大值':
+            self.lineEdit_4.setText(self.comboBox_4.currentText())
+            self.lineEdit_4.setEnabled(False)
+        else:
+            self.lineEdit_4.setText('')
+            self.lineEdit_4.setEnabled(True)
+
+
+    
         
     def change_time_unit(self):
         unit_mapping = {'s':1, 'ms':1000, 'μs':1000000, 'ns':1000000000}
@@ -1037,36 +1036,82 @@ class mainWindow(QMainWindow, main_window):
         event.accept()
 
     def data_range(self, x, y_data):
-        # 计算 vrange（假设 y_data 是 numpy 数组）
-        vrange = np.average(y_data[:1000]) + np.average(y_data[-1000:])
-
+        # 确保输入是numpy数组
+        x = np.asarray(x)
+        y_data = np.asarray(y_data)
+        
         # 初始化筛选条件（默认不筛选）
-        x_mask = np.ones_like(x, dtype=bool)  # 默认全部为True（不筛选）
+        x_mask = np.ones_like(x, dtype=bool)
         y_mask = np.ones_like(y_data, dtype=bool)
 
-        # 处理 x 范围筛选（如果输入不为空）
+        # 处理时间范围筛选（x轴范围）
         if self.lineEdit_2.text():  # x_min
             x_min = float(self.lineEdit_2.text())
-            x_mask &= (x > x_min)  # 与现有条件取交集
+            x_mask &= (x >= x_min)
 
         if self.lineEdit_5.text():  # x_max
             x_max = float(self.lineEdit_5.text())
-            x_mask &= (x < x_max)
-
-        # 处理 y 范围筛选（如果输入不为空）
-        if self.lineEdit_3.text():  # y_min
-            y_min = float(self.lineEdit_3.text()) * vrange * 0.01
-            y_mask &= (y_data > y_min)
-
-        if self.lineEdit_4.text():  # y_max
-            y_max = float(self.lineEdit_4.text()) * vrange * 0.01
-            y_mask &= (y_data < y_max)
-
-        # 合并条件并筛选数据
-        combined_mask = x_mask & y_mask
-        x_filtered = x[combined_mask]
-        y_filtered = y_data[combined_mask]
-
+            x_mask &= (x <= x_max)
+        
+        # 应用时间筛选后的数据
+        x_filtered = x[x_mask]
+        y_filtered = y_data[x_mask]
+        
+        # 如果没有数据通过时间筛选，直接返回空数组
+        if len(x_filtered) == 0:
+            return np.array([]), np.array([])
+        
+        # 计算vrange（基于时间筛选后的数据）
+        vrange = np.max(y_filtered) - np.min(y_filtered)
+        
+        # 处理最大值条件 - 将最大值点设为起点（时间0点）
+        if self.lineEdit_4.text():
+            if self.lineEdit_4.text().lower() == '最大值':
+                max_idx = np.argmax(y_filtered)
+                x_filtered = x_filtered[max_idx:]
+                y_filtered = y_filtered[max_idx:]
+                time_offset = x_filtered[0]
+                x_filtered = x_filtered - time_offset
+        
+        # 处理最小值条件 - 将最小值点设为终点
+        if self.lineEdit_3.text():
+            if self.lineEdit_3.text().lower() == '最小值':
+                min_idx = np.argmin(y_filtered)
+                x_filtered = x_filtered[:min_idx+1]
+                y_filtered = y_filtered[:min_idx+1]
+        
+        # 处理百分比范围条件
+        if self.lineEdit_4.text() and self.lineEdit_4.text().lower() != '最大值':
+            try:
+                y_max = float(self.lineEdit_4.text()) * vrange * 0.01
+                mask = (y_filtered <= y_max)
+                x_filtered = x_filtered[mask]
+                y_filtered = y_filtered[mask]
+            except ValueError:
+                pass
+        
+        if self.lineEdit_3.text() and self.lineEdit_3.text().lower() != '最小值':
+            try:
+                y_min = float(self.lineEdit_3.text()) * vrange * 0.01
+                mask = (y_filtered >= y_min)
+                x_filtered = x_filtered[mask]
+                y_filtered = y_filtered[mask]
+            except ValueError:
+                pass
+        
+        # 保留您最初的调试信息
+        print('def data_range')
+        if len(y_filtered) > 0:
+            print('y 起始值:', y_filtered[0])
+        if len(x_filtered) > 0:
+            print('x 起始值:', f'{x_filtered[0]:.20f}')
+        if len(y_filtered) > 0:
+            print('y 终点:', y_filtered[-1])
+        if len(x_filtered) > 0:
+            print('x 终点:', f'{x_filtered[-1]:.20f}')
+        print(f"x_filtered数据形状: {x_filtered.shape}, 数据类型: {x_filtered.dtype}")
+        print(f"y_filtered数据形状: {y_filtered.shape}, 数据类型: {y_filtered.dtype}")
+为什么时间筛选后的x起始值是0.000000001，x终点0.0000674，在全部执行完后，x起始值为0，x终点
         return x_filtered, y_filtered
 
     def calculate_decay(self, item=None):
@@ -1235,16 +1280,21 @@ class mainWindow(QMainWindow, main_window):
                 print(f"单指数拟合结果: lifetime = {lifetime:.6f}")
 
             elif models_to_test == '双指数':
-                b = result.params[1]
-                d = result.params[3]
+            # 获取系数b和d (对应两个衰减速率)
+                a = result.params[0] if result.params[3] > result.params[1] else result.params[2]
+                b = result.params[1] if result.params[3] > result.params[1] else result.params[3] # 第一个衰减速率
+                c = result.params[2] if result.params[3] > result.params[1] else result.params[0]
+                d = result.params[3] if result.params[3] > result.params[1] else result.params[1] # 第二个衰减速率            
+                # 计算两个寿命
                 tau1 = -1/b if b != 0 else float('inf')
                 tau2 = -1/d if d != 0 else float('inf')
                 
-                self.lineEdit_27.setText(f"{result.params[0]:.10f}")
+                # 在界面上显示
+                self.lineEdit_27.setText(f"{a:.10f}")
                 self.lineEdit.setText(f"{tau1:.10f}")
-                self.lineEdit_26.setText(f"{result.params[2]:.10f}")
+                self.lineEdit_26.setText(f"{c:.10f}")
                 self.lineEdit_28.setText(f"{tau2:.10f}")
-                self.lineEdit_29.setText(f"{result.params[4]:.10f}")
+                self.lineEdit_29.setText(f"{result.params[4]:.10f}")     
                 
                 print(f"双指数拟合结果: tau1 = {tau1:.10f}, tau2 = {tau2:.10f}")
 
