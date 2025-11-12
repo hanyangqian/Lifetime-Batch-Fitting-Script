@@ -32,7 +32,17 @@ import warnings
 from enum import Enum
 import inspect
 
+# 常量定义
+DEFAULT_FIT_OPTIONS = {
+    'DiffMinChange': 1e-8,
+    'DiffMaxChange': 0.1,
+    'MaxIter': 400,
+    'MaxFunEvals': 600,
+    'TolFun': 1e-6,
+    'TolX': 1e-6
+}
 
+UNIT_MAPPING = {'s': 1, 'ms': 1000, 'μs': 1000000, 'ns': 1000000000}
 
 class RobustMethod(Enum):
     OFF = 'Off'
@@ -266,9 +276,7 @@ class MATLABCurveFitter:
     
     
     def _get_model_definition(self, model_type):
-        """
-        使用预定义模型进行拟合
-        """
+        """修改双指数模型定义"""
         models = {
             'linear': {
                 'function': lambda x, a, b: a * x + b,
@@ -276,14 +284,14 @@ class MATLABCurveFitter:
                 'description': 'y = a*x + b'
             },
             '单指数': {
-                'function': lambda x, a, b, c: a * np.exp(b * x) + c,
+                'function': lambda x, a, b, c: a * np.exp(-x/b) + c,  # 修改为 -x/b
                 'param_names': ['a', 'b', 'c'],
-                'description': 'y = a*exp(b*x) + c'
+                'description': 'y = a*exp(-x/b) + c'
             },
             '双指数': {
-                'function': lambda x, a, b, c, d, e: a * np.exp(b * x) + c * np.exp(d * x) + e,
-                'param_names': ['a', 'b', 'c', 'd', 'e'],
-                'description': 'y = a*exp(-x/b) + c*exp(-x/d) + e'
+                'function': lambda x, a, t1, c, t2, e: a * np.exp(-x/t1) + c * np.exp(-x/t2) + e,
+                'param_names': ['a', 't1', 'c', 't2', 'e'],
+                'description': 'y = a*exp(-x/t1) + c*exp(-x/t2) + e'
             },
             'polynomial2': {
                 'function': lambda x, a, b, c: a * x**2 + b * x + c,
@@ -291,233 +299,223 @@ class MATLABCurveFitter:
                 'description': 'y = a*x² + b*x + c'
             },
         }
-        
         return models.get(model_type)
 
     def _get_default_start_point(self, model_type, x, y):
-        """获取更合理的默认起始点"""
-        if model_type == 'linear':
-            # 线性回归计算斜率和截距
-            if len(x) > 1:
-                slope = (y[-1] - y[0]) / (x[-1] - x[0]) if x[-1] != x[0] else 1.0
-                intercept = y[0] - slope * x[0]
-                return [slope, intercept]
-            return [1.0, 0.0]
-        
-        elif model_type == '单指数':
-            # 单指数起始点
+        """修改双指数模型的初始参数计算"""
+        if model_type == '双指数':
             y_range = np.max(y) - np.min(y)
             if y_range == 0:
                 y_range = 1.0
-            return [y_range, -0.1, np.min(y)]
-        
-        elif model_type == '双指数':
-            # 双指数起始点 - 更保守的估计
-            y_range = np.max(y) - np.min(y)
-            if y_range == 0:
-                y_range = 1.0
+                
+            # 计算初始时间常数估计 (t1和t2)
+            # 方法1：使用数据的分位数估计衰减时间
+            decay_10_idx = np.argmin(np.abs(y - (np.max(y)*0.1)))
+            decay_50_idx = np.argmin(np.abs(y - (np.max(y)*0.5)))
+            
+            # 确保有足够的点用于估计
+            if decay_50_idx < 1:
+                decay_50_idx = len(x) // 2
+            if decay_10_idx <= decay_50_idx:
+                decay_10_idx = decay_50_idx + len(x) // 4
+                
+            # 计算时间常数 (t1和t2)，确保 t1 < t2
+            t1_guess = x[decay_50_idx] / np.log(2)  # 快速衰减分量（半衰期估计）
+            t2_guess = x[decay_10_idx] / np.log(10)  # 慢速衰减分量（1/10衰减期估计）
+            
+            # 确保 t1 < t2（快速分量衰减更快）
+            if t1_guess >= t2_guess:
+                t1_guess, t2_guess = t2_guess, t1_guess
+                # 如果交换后仍然不满足，设置默认比例
+                if t1_guess >= t2_guess:
+                    t1_guess = t2_guess / 5
+            
+            # 确保时间常数为正值
+            t1_guess = max(t1_guess, 1e-6)
+            t2_guess = max(t2_guess, t1_guess * 1.1)
+            
             return [
-                y_range * 0.7,  # a
-                -0.1,           # b (衰减速率1)
-                y_range * 0.3,  # c  
-                -0.01,          # d (衰减速率2)
+                y_range * 0.7,  # a (快速分量振幅)
+                t1_guess,       # t1 (快速衰减时间常数)
+                y_range * 0.3,  # c (慢速分量振幅)
+                t2_guess,       # t2 (慢速衰减时间常数)
                 np.min(y)       # e (基线)
             ]
+        elif model_type == '单指数':
+            # 单指数衰减模型的初始值计算
+            y_range = np.max(y) - np.min(y)
+            if y_range == 0:
+                y_range = 1.0
+            
+            # 使用对数线性回归估计衰减率
+            y_adj = y - np.min(y) + 1e-10
+            valid_idx = y_adj > 0.1 * np.max(y_adj)
+            if np.sum(valid_idx) > 2:
+                log_y = np.log(y_adj[valid_idx])
+                slope, _ = np.polyfit(x[valid_idx], log_y, 1)
+                tau = -1.0/slope if slope < 0 else -0.1
+            else:
+                tau = -0.1
+                
+            return [y_range, 1.0/tau, np.min(y)]
         
-        elif model_type == 'polynomial2':
-            return [0.0, 0.0, np.mean(y)]
+        # 其他模型的默认初始值
+        return [1.0] * len(self._get_model_definition(model_type)['param_names'])
         
-        else:
-            model_def = self._get_model_definition(model_type)
-            if model_def:
-                return [1.0] * len(model_def['param_names'])
-            return [1.0]
         
     def _fit_implementation(self, x, y, func, initial_guess, param_names):
-        """拟合实现核心"""
+        """改进的拟合实现核心"""
         result = MATLABFitResult()
         result.param_names = param_names
         
-        # 稳健拟合迭代
-        weights = self.options.Weights
-        robust_weights = np.ones_like(y)
-        prev_params = np.array(initial_guess)
+        # 设置优化选项
+        lsq_options = {
+            'method': 'trf' if self.options.Algorithm == Algorithm.TRUST_REGION else 'lm',
+            'max_nfev': self.options.MaxFunEvals,
+            'ftol': self.options.TolFun,
+            'xtol': self.options.TolX,
+            'gtol': self.options.TolX,
+            'x_scale': 'jac',
+            'verbose': 2,  # 输出详细优化信息
+            'tr_solver': 'lsmr',  # 使用更稳定的求解器
+            'loss': 'soft_l1' if self.options.Robust != RobustMethod.OFF else 'linear',
+        }
         
-        for robust_iter in range(50):  # MATLAB最大稳健迭代
-            # 配置最小二乘选项
-            lsq_options = {
-                'method': 'trf' if self.options.Algorithm == Algorithm.TRUST_REGION else 'lm',
-                'max_nfev': self.options.MaxFunEvals,
-                'ftol': self.options.TolFun,
-                'xtol': self.options.TolX,
-                'gtol': self.options.TolX,  # MATLAB中gtol通常等于xtol
-                'x_scale': 'jac',
-                'verbose': 0
-            }
+        # 设置参数边界 (特别是对指数衰减模型)
+        if 'exp' in func.__code__.co_name.lower():  # 如果是指数模型
+            bounds_lower = np.full_like(initial_guess, -np.inf)
+            bounds_upper = np.full_like(initial_guess, np.inf)
             
-            # 设置边界
-            if self.options.Algorithm == Algorithm.TRUST_REGION and \
-               (np.isfinite(self.options.Lower).any() or np.isfinite(self.options.Upper).any()):
-                bounds = (np.full_like(initial_guess, self.options.Lower), 
-                         np.full_like(initial_guess, self.options.Upper))
-                lsq_options['bounds'] = bounds
+            # 对衰减率参数设置合理边界
+            for i, name in enumerate(param_names):
+                if name in ['t1', 't2', 'b', 'd']:  # 衰减率参数
+                    bounds_lower[i] = 1e-6  # 最小衰减时间常数
+                    bounds_upper[i] = 1000  # 最大衰减时间常数
+                elif name in ['a', 'c']:  # 振幅参数
+                    bounds_lower[i] = 0  # 振幅必须非负
             
-            try:
-                # 目标函数
-                def objective(params):
-                    y_pred = func(x, *params)
-                    residuals = y - y_pred
-                    
-                    # 应用稳健权重
-                    if self.options.Robust != RobustMethod.OFF and robust_iter > 0:
-                        residuals = residuals * np.sqrt(robust_weights)
-                    
-                    # 应用用户权重
-                    if weights is not None:
-                        residuals = residuals * np.sqrt(weights)
-                    
-                    return residuals
+            # 如果是双指数模型，添加 t1 < t2 的约束
+            if len(param_names) >= 5 and 't1' in param_names and 't2' in param_names:
+                t1_idx = param_names.index('t1')
+                t2_idx = param_names.index('t2')
+                # 确保 t1 < t2 的边界约束
+                bounds_upper[t1_idx] = bounds_upper[t2_idx]  # t1 的上限不超过 t2 的上限
+            
+            lsq_options['bounds'] = (bounds_lower, bounds_upper)
+        
+        try:
+            # 定义目标函数
+            def objective(params):
+                # 如果是双指数模型，强制 t1 < t2
+                if len(params) >= 5 and hasattr(self, 'current_model_type') and self.current_model_type == '双指数':
+                    t1_idx = 1  # t1 在参数列表中的位置
+                    t2_idx = 3  # t2 在参数列表中的位置
+                    if params[t1_idx] >= params[t2_idx]:
+                        # 如果 t1 >= t2，返回很大的残差来惩罚这种配置
+                        return np.full_like(y, 1e10)
                 
-                # 执行拟合
-                lsq_result = least_squares(objective, initial_guess, **lsq_options)
-                
-                result.params = lsq_result.x
-                result.success = lsq_result.success
-                result.message = lsq_result.message
-                result.iterations = lsq_result.nfev
-                result.funcCount = lsq_result.nfev
-                result.jacobian = lsq_result.jac
-                
-                # 计算预测值和残差
-                y_pred = func(x, *result.params)
+                y_pred = func(x, *params)
                 residuals = y - y_pred
                 
-                # 更新稳健权重
+                # 应用稳健权重
                 if self.options.Robust != RobustMethod.OFF:
-                    new_robust_weights = self._robust_weight_function(residuals, self.options.Robust)
-                    
-                    # 检查稳健收敛
-                    if robust_iter > 0 and np.max(np.abs(new_robust_weights - robust_weights)) < 1e-6:
-                        break
-                    
-                    robust_weights = new_robust_weights
-                else:
-                    break
-                    
-                # 检查参数收敛
-                if np.max(np.abs(result.params - prev_params)) < self.options.TolX:
-                    break
-                    
-                prev_params = result.params.copy()
+                    weights = self._robust_weight_function(residuals, self.options.Robust)
+                    residuals = residuals * np.sqrt(weights)
                 
-            except Exception as e:
-                result.success = False
-                result.message = f"拟合失败: {str(e)}"
-                break
-        
-        # 计算拟合优度
-        y_pred = func(x, *result.params)
-        residuals = y - y_pred
-        
-        # 应用最终权重计算统计量
-        final_weights = weights
-        if self.options.Robust != RobustMethod.OFF:
-            if final_weights is None:
-                final_weights = robust_weights
-            else:
-                final_weights = final_weights * robust_weights
-        
-        sse, rsquare, dfe, adjrsquare, rmse = self._calculate_goodness_of_fit(
-            y, y_pred, residuals, len(param_names), final_weights)
-        
-        result.sse = sse
-        result.rsquare = rsquare
-        result.dfe = dfe
-        result.adjrsquare = adjrsquare
-        result.rmse = rmse
-        result.residuals = residuals
+                # 应用用户权重
+                if self.options.Weights is not None:
+                    residuals = residuals * np.sqrt(self.options.Weights)
+                
+                return residuals
+            
+            # 执行拟合 - 分阶段优化策略
+            print(f"初始参数: {initial_guess}")
+            
+            # 第一阶段: 宽松容差快速拟合
+            phase1_options = lsq_options.copy()
+            phase1_options['ftol'] = 1e-6
+            phase1_options['xtol'] = 1e-6
+            phase1_options['max_nfev'] = min(200, self.options.MaxFunEvals//2)
+            
+            phase1_result = least_squares(objective, initial_guess, **phase1_options)
+            print(f"第一阶段结果: {phase1_result.x}")
+            
+            # 第二阶段: 严格容差精细拟合
+            phase2_options = lsq_options.copy()
+            phase2_result = least_squares(objective, phase1_result.x, **phase2_options)
+            print(f"第二阶段结果: {phase2_result.x}")
+            
+            # 保存最终结果
+            result.params = phase2_result.x
+            result.success = phase2_result.success
+            result.message = phase2_result.message
+            result.iterations = phase2_result.nfev
+            result.funcCount = phase2_result.nfev
+            result.jacobian = phase2_result.jac
+            
+            # 计算拟合优度统计量
+            y_pred = func(x, *result.params)
+            residuals = y - y_pred
+            
+            sse, rsquare, dfe, adjrsquare, rmse = self._calculate_goodness_of_fit(
+                y, y_pred, residuals, len(param_names))
+            
+            result.sse = sse
+            result.rsquare = rsquare
+            result.dfe = dfe
+            result.adjrsquare = adjrsquare
+            result.rmse = rmse
+            result.residuals = residuals
+            
+        except Exception as e:
+            result.success = False
+            result.message = f"拟合失败: {str(e)}"
+            print(f"拟合错误: {str(e)}")
+            print(traceback.format_exc())
         
         return result
-    
+
 class mainWindow(QMainWindow, main_window):
     def __init__(self, parent=None, product_names=None):
         super(mainWindow, self).__init__(parent)
         self.setupUi(self)
         
-        self.temperature_calibration=[50,100,150,200,250,300,350,400,450,500,550,600]
-        self.lifetime_calibration=[3.646040506,3.212977315,2.842532971,2.519596718,2.236712857,1.981563617,1.710492252,1.280798396,0.688913014,0.379551499,0.321295208,0.317258355]
+        # 使用常量初始化
+        self.temperature_calibration = [50,100,150,200,250,300,350,400,450,500,550,600]
+        self.lifetime_calibration = [3.646040506,3.212977315,2.842532971,2.519596718,2.236712857,1.981563617,1.710492252,1.280798396,0.688913014,0.379551499,0.321295208,0.317258355]
 
-        # 初始化QSettings
+        # 初始化设置
         self.settings = QSettings("YourCompany", "PMT_Analysis")
-        
         self.setup_matplotlib_chinese()
 
+        # 连接信号槽
+        self._connect_signals()
+        
+        # 初始化变量
+        self._initialize_variables()
+        
+        # 初始化UI组件
+        self._initialize_ui()
+        
+        # 恢复设置
+        self.restore_previous_settings()
+
+    def _connect_signals(self):
+        """集中连接所有信号槽"""
         self.treeWidget.itemClicked.connect(self.calculate_decay)
-        self.lineEdit_8.setEnabled(False)
         self.comboBox_10.currentIndexChanged.connect(self.comboBox_10_changed)
         self.comboBox.currentIndexChanged.connect(self.fit_curve_model)
-        self.result = None
-        self.file_path = None
-        self.img_directory = None
-        self.download_directory = None
-
-        #设置文件夹
+        
+        # 文件夹设置
         self.pushButton.clicked.connect(self.set_work_directory)
         self.pushButton_2.clicked.connect(self.select_target_files)
         self.pushButton_3.clicked.connect(self.set_download_directory)
-        self.pushButton_4.clicked.connect(self.set_img_directory)
         
         # 下载按钮
         self.pushButton_5.clicked.connect(self.save_all)
-        # self.pushButton_7.clicked.connect(self.save_one)
-        
-
-        # 初始化treeWidget设置
-        self.treeWidget.setHeaderLabels(["文件列表"])
-        self.treeWidget.setColumnCount(1)
-
-        # 初始化matplotlib图形
-        self.figure = Figure()
-        self.canvas = FC(self.figure)
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        
-        # 将matplotlib组件添加到graphicsView
-        layout = QtWidgets.QVBoxLayout(self.graphicsView)
-        layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
-
-        # 初始化第二个matplotlib图形 - 第二个图形视图
-        self.figure2 = Figure()
-        self.canvas2 = FC(self.figure2)
-        self.toolbar2 = NavigationToolbar(self.canvas2, self)
-        
-        # 将matplotlib组件添加到graphicsView2
-        layout2 = QtWidgets.QVBoxLayout(self.graphicsView_2)
-        layout2.addWidget(self.toolbar2)
-        layout2.addWidget(self.canvas2)
-        
-        # 初始化第三个matplotlib图形 - 第三个图形视图
-        self.figure3 = Figure()
-        self.canvas3 = FC(self.figure3)
-        self.toolbar3 = NavigationToolbar(self.canvas3, self)
-        
-        # 将matplotlib组件添加到graphicsView3
-        layout3 = QtWidgets.QVBoxLayout(self.graphicsView_3)
-        layout3.addWidget(self.toolbar3)
-        layout3.addWidget(self.canvas3)
-        
-        # 存储当前选中的文件数据
-        self.file_data_cache = {}
-        
-        self.lifetime = None
-        
-        # 恢复上一次的设置
-        self.restore_previous_settings()
+        self.pushButton_7.clicked.connect(self.save_one)
         
         # 数据筛选
-        self.lineEdit_3.setEnabled(True)
-        self.lineEdit_4.setEnabled(False)
-
         self.comboBox_3.currentTextChanged.connect(self.change_range)
         self.comboBox_4.currentTextChanged.connect(self.change_range)
         
@@ -525,11 +523,183 @@ class mainWindow(QMainWindow, main_window):
         self.comboBox_5.currentTextChanged.connect(self.change_time_unit)
         self.comboBox_6.currentTextChanged.connect(self.change_time_unit)
         self.comboBox_7.currentTextChanged.connect(self.change_time_unit)
-
-        
         
         # 寿命、温度计算
-        self.pushButton_6.clicked.connect(self.calculate_decay)   
+        self.pushButton_6.clicked.connect(self.calculate_decay)
+
+    def _initialize_variables(self):
+        """初始化实例变量"""
+        self.result = None
+        self.file_path = None
+        self.img_directory = None
+        self.download_directory = None
+        self.file_data_cache = {}
+        self.lifetime = None
+        self.temperature_measure = None
+        self.current_model_type = None
+        
+        # 时间单位
+        self.time_unit_5 = 1
+        self.time_unit_6 = 1
+        self.time_unit_7 = 1
+
+    def _initialize_ui(self):
+        """初始化UI组件"""
+        self.lineEdit_8.setEnabled(False)
+        self.lineEdit_3.setEnabled(True)
+        self.lineEdit_4.setEnabled(False)
+        
+        # 初始化treeWidget
+        self.treeWidget.setHeaderLabels(["文件列表"])
+        self.treeWidget.setColumnCount(1)
+        
+        # 初始化matplotlib图形
+        self._setup_matplotlib_canvases()
+
+    def _setup_matplotlib_canvases(self):
+        """设置matplotlib画布 - 最小化工具栏版本"""
+        # 第一个图形
+        self.figure = Figure(figsize=(5, 4))  # 设置图形尺寸
+        self.figure.subplots_adjust(left=0.12, bottom=0.15, right=0.95, top=0.92)
+        self.canvas = FC(self.figure)
+        self.toolbar = self._create_minimal_toolbar(self.canvas)
+        self._add_canvas_to_layout(self.graphicsView, self.toolbar, self.canvas)
+        
+        # 第二个图形
+        self.figure2 = Figure(figsize=(5, 4))
+        self.figure2.subplots_adjust(left=0.12, bottom=0.15, right=0.95, top=0.92)
+        self.canvas2 = FC(self.figure2)
+        self.toolbar2 = self._create_minimal_toolbar(self.canvas2)
+        self._add_canvas_to_layout(self.graphicsView_2, self.toolbar2, self.canvas2)
+        
+        # 第三个图形
+        self.figure3 = Figure(figsize=(5, 4))
+        self.figure3.subplots_adjust(left=0.12, bottom=0.15, right=0.95, top=0.92)
+        self.canvas3 = FC(self.figure3)
+        self.toolbar3 = self._create_minimal_toolbar(self.canvas3)
+        self._add_canvas_to_layout(self.graphicsView_3, self.toolbar3, self.canvas3)
+
+    def _create_minimal_toolbar(self, canvas):
+        """创建最小化工具栏 - 只保留关键功能"""
+        toolbar = NavigationToolbar(canvas, self)
+        
+        # 移除不必要的按钮
+        actions_to_remove = []
+        for action in toolbar.actions():
+            text = action.text().lower() if action.text() else ""
+            if any(word in text for word in ['subplots', 'customize', 'save']):
+                actions_to_remove.append(action)
+        
+        for action in actions_to_remove:
+            toolbar.removeAction(action)
+        
+        # 设置小尺寸样式
+        toolbar.setStyleSheet("""
+            QToolBar {
+                background-color: #f0f0f0;
+                spacing: 1px;
+                padding: 0px;
+                margin: 0px;
+                border: none;
+            }
+            QToolButton {
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 2px;
+                padding: 1px;
+                margin: 0px;
+            }
+            QToolButton:hover {
+                background-color: #d0d0d0;
+                border: 1px solid #a0a0a0;
+            }
+            QToolButton:pressed {
+                background-color: #b0b0b0;
+            }
+        """)
+        
+        # 设置固定小尺寸
+        toolbar.setFixedHeight(22)
+        
+        # 设置小图标
+        for action in toolbar.actions():
+            widget = toolbar.widgetForAction(action)
+            if widget and hasattr(widget, 'setIconSize'):
+                widget.setIconSize(QtCore.QSize(14, 14))
+                widget.setFixedSize(20, 18)
+        
+        return toolbar
+
+    def _add_canvas_to_layout(self, graphics_view, toolbar, canvas):
+        """将matplotlib组件添加到布局 - 优化空间利用"""
+        # 清除现有布局
+        if graphics_view.layout() is not None:
+            QtWidgets.QWidget().setLayout(graphics_view.layout())
+        
+        layout = QtWidgets.QVBoxLayout(graphics_view)
+        layout.setContentsMargins(1, 1, 1, 1)  # 最小边距
+        layout.setSpacing(1)  # 最小间距
+        
+        if toolbar:
+            layout.addWidget(toolbar)
+        
+        layout.addWidget(canvas)
+        
+        # 设置graphicsView的尺寸策略，优先给图形更多空间
+        graphics_view.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+    def _safe_float_conversion(self, text, default=0.0):
+        """安全的浮点数转换"""
+        try:
+            return float(text) if text else default
+        except ValueError:
+            return default
+
+    def _safe_int_conversion(self, text, default=0):
+        """安全的整数转换"""
+        try:
+            return int(text) if text else default
+        except ValueError:
+            return default
+
+    def get_fit_options(self):
+        """安全获取拟合选项"""
+        return {
+            'DiffMinChange': self._safe_float_conversion(self.lineEdit_19.text(), DEFAULT_FIT_OPTIONS['DiffMinChange']),
+            'DiffMaxChange': self._safe_float_conversion(self.lineEdit_20.text(), DEFAULT_FIT_OPTIONS['DiffMaxChange']),
+            'MaxIter': self._safe_int_conversion(self.lineEdit_21.text(), DEFAULT_FIT_OPTIONS['MaxIter']),
+            'MaxFunEvals': self._safe_int_conversion(self.lineEdit_22.text(), DEFAULT_FIT_OPTIONS['MaxFunEvals']),
+            'TolFun': self._safe_float_conversion(self.lineEdit_23.text(), DEFAULT_FIT_OPTIONS['TolFun']),
+            'TolX': self._safe_float_conversion(self.lineEdit_24.text(), DEFAULT_FIT_OPTIONS['TolX'])
+        }
+
+    def _get_file_filters(self):
+        """获取文件过滤器"""
+        return (
+            "Supported Files (*.xlsx *.xls *.txt *.csv);;"
+            "Excel Files (*.xlsx *.xls);;"
+            "Text Files (*.txt);;"
+            "CSV Files (*.csv);;"
+            "All Files (*.*)"
+        )
+
+    def _validate_file_extension(self, file_path):
+        """验证文件扩展名"""
+        return file_path.lower().endswith(('.xlsx', '.xls', '.txt', '.csv'))
+
+    def _create_tree_item(self, file_path):
+        """创建树形项目"""
+        file_name = os.path.basename(file_path)
+        item = QTreeWidgetItem(self.treeWidget)
+        item.setText(0, file_name)
+        item.setData(0, QtCore.Qt.UserRole, file_path)
+        return item
+
+    def setup_matplotlib_chinese(self):
+        """配置matplotlib支持中文显示"""
+        # 设置中文字体
+        mpl.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'WenQuanYi Zen Hei']  # 指定默认字体
+        mpl.rcParams['axes.unicode_minus'] = False  # 解决保存图像时负号'-'显示为方块的问题
 
     def change_range(self):
         comboBox_3 = self.comboBox_3.currentText()
@@ -547,18 +717,13 @@ class mainWindow(QMainWindow, main_window):
             self.lineEdit_4.setText('')
             self.lineEdit_4.setEnabled(True)
 
-
-    
-        
     def change_time_unit(self):
-        unit_mapping = {'s':1, 'ms':1000, 'μs':1000000, 'ns':1000000000}
-        
         text_5 = self.comboBox_5.currentText()
         text_6 = self.comboBox_6.currentText()
         text_7 = self.comboBox_7.currentText()
-        self.time_unit_5 = unit_mapping[text_5]
-        self.time_unit_6 = unit_mapping[text_6]
-        self.time_unit_7 = unit_mapping[text_7]
+        self.time_unit_5 = UNIT_MAPPING[text_5]
+        self.time_unit_6 = UNIT_MAPPING[text_6]
+        self.time_unit_7 = UNIT_MAPPING[text_7]
     
     def fit_curve_model(self):
         text = self.comboBox.currentText()
@@ -566,7 +731,6 @@ class mainWindow(QMainWindow, main_window):
             self.label_21.setText('I(t) = A1exp(-t/τ1) + A2exp(-t/τ2) + I0')
         if text == '单指数':
             self.label_21.setText('I(t) = Aexp(-t/τ) + I0')
-
 
     def comboBox_10_changed(self):
         text = self.comboBox_10.currentText()
@@ -587,8 +751,7 @@ class mainWindow(QMainWindow, main_window):
         if last_download_dir and os.path.exists(last_download_dir):
             self.pushButton_3.setText(last_download_dir)
         last_img_dir = self.settings.value("last_img_directory", "")
-        if last_img_dir and os.path.exists(last_img_dir):
-            self.pushButton_4.setText(last_img_dir)
+
         
         # 恢复文件列表
         file_list = self.settings.value("last_file_list", [])
@@ -596,9 +759,7 @@ class mainWindow(QMainWindow, main_window):
             for file_path in file_list:
                 if os.path.exists(file_path):
                     file_name = os.path.basename(file_path)
-                    item = QTreeWidgetItem(self.treeWidget)
-                    item.setText(0, file_name)
-                    item.setData(0, QtCore.Qt.UserRole, file_path)
+                    item = self._create_tree_item(file_path)
             
             # 更新按钮文本显示已选择文件数量
             selected_count = self.treeWidget.topLevelItemCount()
@@ -655,9 +816,7 @@ class mainWindow(QMainWindow, main_window):
         download_dir = self.pushButton_3.text()
         if download_dir and os.path.exists(download_dir):
             self.settings.setValue("last_download_directory", download_dir)        
-        img_dir = self.pushButton_4.text()
-        if img_dir and os.path.exists(img_dir):
-            self.settings.setValue("last_img_directory", img_dir)        
+
         
         # 保存文件列表
         file_list = []
@@ -668,12 +827,6 @@ class mainWindow(QMainWindow, main_window):
                 file_list.append(file_path)
         
         self.settings.setValue("last_file_list", file_list)
-
-    def setup_matplotlib_chinese(self):
-        """配置matplotlib支持中文显示"""
-        # 设置中文字体
-        mpl.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'WenQuanYi Zen Hei']  # 指定默认字体
-        mpl.rcParams['axes.unicode_minus'] = False  # 解决保存图像时负号'-'显示为方块的问题
 
     def set_work_directory(self):
         """打开文件夹选择对话框并更新lineEdit内容"""
@@ -694,13 +847,85 @@ class mainWindow(QMainWindow, main_window):
                 self.save_current_settings()
             else:
                 print("警告：路径不可访问")
+                
+    def save_one(self):
+        """保存当前文件的衰减计算结果到txt文件"""
+        
+        try:
+            # 检查是否有选中的文件
+            current_item = self.treeWidget.currentItem()
+            if current_item is None:
+                QMessageBox.warning(self, "警告", "请先选择一个文件")
+                return
+            
+            # 检查保存目录是否设置
+            self.download_directory = self.pushButton_3.text()
 
+            if not self.download_directory or not os.path.exists(self.download_directory):
+                QMessageBox.warning(self, "警告", "请先设置有效的保存目录")
+                return
+            
+            file_path = current_item.data(0, QtCore.Qt.UserRole)
+            file_name = os.path.basename(file_path)
+            
+            # 创建进度对话框
+            progress = self.create_progress_dialog("处理进度", "正在处理文件...", 1)
+            self.update_progress(progress, 0, f"正在处理: {file_name}")
+            
+            print(f"文件路径: {file_path}")
+
+            # 加载文件数据
+            if not self.load_file_data(file_path):
+                QMessageBox.warning(self, "错误", f"无法加载文件数据: {file_name}")
+                progress.close()
+                return
+            
+            # 调用calculate_decay，不显示内部进度对话框
+            success = self.calculate_decay(current_item, show_progress=False)
+            if not success:
+                QMessageBox.warning(self, "错误", f"处理文件 {file_name} 失败")
+                progress.close()
+                return
+            
+            # 收集拟合结果
+            result_data = self._create_result_data(file_name)
+            if not result_data:
+                QMessageBox.warning(self, "警告", "当前文件拟合失败，无法保存结果")
+                progress.close()
+                return
+
+            # 完成进度条
+            self.update_progress(progress, 1, "正在保存结果...")
+            
+            # 设置输出文件名
+            output_file = self._get_output_filename(file_name, self.download_directory)
+            
+            # 写入文件
+            with open(output_file, 'w', encoding='utf-8') as f:
+                # 写入表头
+                header = self._generate_header(result_data)
+                f.write(header + '\n')
+                
+                # 写入数据
+                line = self._format_result_line(result_data)
+                f.write(line + '\n')
+            
+            progress.close()
+            
+            QMessageBox.information(self, "完成", f"结果已保存到: {output_file}")
+            print(f"结果已保存到: {output_file}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存结果时出错: {str(e)}")
+            traceback.print_exc()
+        
     def save_all(self):
-        """保存所有文件的衰减计算结果到txt文件"""
+        """保存所有文件的衰减计算结果到txt文件 - 详细进度版本"""
         
         try:
             # 检查是否有文件需要处理
-            if self.treeWidget.topLevelItemCount() == 0:
+            file_count = self.treeWidget.topLevelItemCount()
+            if file_count == 0:
                 QMessageBox.warning(self, "警告", "没有可处理的文件")
                 return
             
@@ -711,97 +936,185 @@ class mainWindow(QMainWindow, main_window):
                 QMessageBox.warning(self, "警告", "请先设置有效的保存目录")
                 return
             
+            # 创建自定义进度对话框
+            progress_dialog = QtWidgets.QDialog(self)
+            progress_dialog.setWindowTitle("处理进度")
+            progress_dialog.setFixedSize(400, 150)
+            progress_dialog.setModal(True)
+            
+            layout = QtWidgets.QVBoxLayout(progress_dialog)
+            
+            # 当前文件标签
+            current_file_label = QtWidgets.QLabel("准备开始...")
+            current_file_label.setAlignment(QtCore.Qt.AlignCenter)
+            layout.addWidget(current_file_label)
+            
+            # 进度条
+            progress_bar = QtWidgets.QProgressBar()
+            progress_bar.setRange(0, file_count)
+            layout.addWidget(progress_bar)
+            
+            # 进度文本
+            progress_text = QtWidgets.QLabel(f"0/{file_count}")
+            progress_text.setAlignment(QtCore.Qt.AlignCenter)
+            layout.addWidget(progress_text)
+            
+            # 取消按钮
+            cancel_button = QtWidgets.QPushButton("取消")
+            cancel_button.clicked.connect(progress_dialog.reject)
+            layout.addWidget(cancel_button)
+            
+            progress_dialog.show()
+            
             # 创建结果列表
-            results = []
+            all_results = []
+            cancelled = False
             
             # 遍历所有文件
-            for i in range(self.treeWidget.topLevelItemCount()):
-                print(i)
-                
-                if not hasattr(self, 'loading_label'):
-                    self.loading_label = QtWidgets.QLabel(self)
-                    self.loading_label.setAlignment(QtCore.Qt.AlignCenter)
-                    self.loading_label.setStyleSheet("""
-                        QLabel {
-                            background-color: rgba(0, 0, 0, 150);
-                            color: white;
-                            font-size: 16px;
-                            border-radius: 10px;
-                            padding: 20px;
-                        }
-                    """)
-                    self.loading_label.setFixedSize(200, 100)
-                    self.loading_label.move(
-                        self.width()//2 - 100, 
-                        self.height()//2 - 50
-                    )
-                
-                self.loading_label.show()
-                self.loading_label.raise_()
-                
-                # 设置动画文本
-                self.loading_text = f"处理{i}中..."
-                
+            for i in range(file_count):
+                # 处理事件，检查是否取消
+                QtWidgets.QApplication.processEvents()
+                if not progress_dialog.isVisible():
+                    cancelled = True
+                    break
+                    
                 item = self.treeWidget.topLevelItem(i)
                 file_path = item.data(0, QtCore.Qt.UserRole)
                 file_name = os.path.basename(file_path)
                 self.file_path = file_path
 
-                print(self.file_path)
+                # 更新进度显示
+                current_file_label.setText(f"正在处理: {file_name}")
+                progress_bar.setValue(i)
+                progress_text.setText(f"{i+1}/{file_count}")
+                
+                QtWidgets.QApplication.processEvents()
+
+                print(f"文件路径: {self.file_path}")
 
                 # 加载文件数据
                 if not self.load_file_data(self.file_path):
                     print(f"跳过无法加载的文件: {file_name}")
                     continue
             
-                self.load_file_data(self.file_path)
-                self.calculate_decay()
+                # 调用calculate_decay并传递item参数，不显示内部进度对话框
+                success = self.calculate_decay(item, show_progress=False)
+                if not success:
+                    print(f"处理文件 {file_name} 失败")
+                    continue
                 
-                # 计算衰减参数
-                try:
-                    results.append(self.lifetime)
-
-                except Exception as e:
-                    print(f"处理文件 {self.file_path} 时出错: {str(e)}")
-                    traceback.print_exc()
+                # 收集拟合结果
+                result_data = self._create_result_data(file_name)
+                if result_data:
+                    all_results.append(result_data)
+                    print(f"成功收集文件 {file_name} 的拟合结果")
+                else:
+                    print(f"收集文件 {file_name} 的拟合结果时出错")
                     continue
             
-            if hasattr(self, 'loading_label'):
-                self.loading_label.hide()
+            progress_dialog.close()
+            
+            # 如果用户取消了操作
+            if cancelled:
+                QMessageBox.information(self, "提示", "操作已取消")
+                return
             
             # 如果没有结果，则返回
-            if not results:
+            if not all_results:
                 QMessageBox.warning(self, "警告", "没有可保存的结果")
                 return
             
-            # 设置输出文件名
+            # 设置输出文件名（添加时间后缀）
             timestamp = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd_hhmmss")
             output_file = os.path.join(self.download_directory, f"decay_results_{timestamp}.txt")
             
-            with open(output_file, 'a', encoding='utf-8') as f:
-                f.write('results\n')
-
+            # 写入文件
+            with open(output_file, 'w', encoding='utf-8') as f:
+                # 写入表头
+                header = self._generate_header(all_results[0])
+                f.write(header + '\n')
+                
+                # 写入数据
+                for result in all_results:
+                    line = self._format_result_line(result)
+                    f.write(line + '\n')
+            
             QMessageBox.information(self, "完成", f"结果已保存到: {output_file}")
+            print(f"结果已保存到: {output_file}")
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存结果时出错: {str(e)}")
             traceback.print_exc()
+
+    def _create_result_data(self, file_name):
+        """创建结果数据结构"""
+        if not (hasattr(self, 'result') and self.result and self.result.success):
+            return None
+            
+        return {
+            'file_name': file_name,
+            'model_type': self.comboBox.currentText(),
+            'params': self.result.params.copy() if self.result.params is not None else [],
+            'param_names': self.result.param_names.copy() if self.result.param_names is not None else [],
+            'sse': self.result.sse,
+            'rsquare': self.result.rsquare,
+            'adjrsquare': self.result.adjrsquare,
+            'rmse': self.result.rmse,
+            'success': self.result.success
+        }
+
+    def _get_output_filename(self, base_name, directory):
+        """生成输出文件名"""
+        timestamp = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd_hhmmss")
+        safe_name = os.path.splitext(base_name)[0]
+        return os.path.join(directory, f"decay_result_{safe_name}_{timestamp}.txt")
+
+    def _generate_header(self, sample_result):
+        """生成表头"""
+        header_parts = ["文件名", "模型类型"]
+        
+        # 添加系数估计的列名
+        if sample_result['param_names']:
+            for param_name in sample_result['param_names']:
+                header_parts.append(f"系数_{param_name}")
+        
+        # 添加拟合优度统计的列名
+        header_parts.extend(["SSE", "R平方", "调整R平方", "RMSE", "拟合成功"])
+        
+        return "\t".join(header_parts)
+
+    def _format_result_line(self, result):
+        """格式化单行结果"""
+        line_parts = [
+            result['file_name'],
+            result['model_type']
+        ]
+        
+        # 添加系数估计的值
+        if result['params'] is not None:
+            for param_value in result['params']:
+                line_parts.append(f"{param_value:.10f}")
+        
+        # 添加拟合优度统计的值
+        line_parts.extend([
+            f"{result['sse']:.10f}",
+            f"{result['rsquare']:.10f}",
+            f"{result['adjrsquare']:.10f}",
+            f"{result['rmse']:.10f}",
+            "是" if result['success'] else "否"
+        ])
+        
+        return "\t".join(line_parts)
     
     def select_target_files(self):
         """打开文件选择对话框，选择Excel/TXT/CSV文件并添加到treeWidget"""
         initial_dir = self.pushButton.text() if self.pushButton.text() else QDir.homePath()
         
-        file_filter = "Supported Files (*.xlsx *.xls *.txt *.csv);;" \
-                     "Excel Files (*.xlsx *.xls);;" \
-                     "Text Files (*.txt);;" \
-                     "CSV Files (*.csv);;" \
-                     "All Files (*.*)"
-        
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择目标文件",
             initial_dir,
-            file_filter
+            self._get_file_filters()
         )
         
         if file_paths:
@@ -809,14 +1122,8 @@ class mainWindow(QMainWindow, main_window):
             self.treeWidget.clear()
             
             for file_path in file_paths:
-                if file_path.lower().endswith(('.xlsx', '.xls', '.txt', '.csv')):
-                    # 创建树形项目并添加到treeWidget
-                    file_name = os.path.basename(file_path)
-                    item = QTreeWidgetItem(self.treeWidget)
-                    item.setText(0, file_name)
-                    
-                    # 可选：将完整路径存储在item中
-                    item.setData(0, QtCore.Qt.UserRole, file_path)
+                if self._validate_file_extension(file_path):
+                    self._create_tree_item(file_path)
                 else:
                     QMessageBox.warning(self, "警告", f"忽略不支持的文件类型: {os.path.basename(file_path)}")
             
@@ -827,7 +1134,56 @@ class mainWindow(QMainWindow, main_window):
             # 保存设置
             self.save_current_settings()
         
-        
+    def _load_excel_data(self, file_path, column1, column2, data_start_row=None):
+        """加载Excel数据"""
+        try:
+            if data_start_row is not None:
+                data = pd.read_excel(file_path, skiprows=data_start_row).iloc[:, [column1, column2]]
+            else:
+                data = pd.read_excel(file_path).iloc[:, [column1, column2]]
+            
+            return self._clean_dataframe(data)
+        except Exception as e:
+            print(f"Excel读取失败: {e}")
+            return None
+
+    def _load_text_data_auto(self, file_path, column1, column2):
+        """自动加载文本数据"""
+        try:
+            # 使用pandas读取，指定数据类型为数值
+            df = pd.read_csv(file_path, header=None, dtype=str)  # 先读为字符串
+            
+            # 查找数据开始行
+            data_start_row = 0
+            for i in range(len(df)):
+                try:
+                    val1 = df.iloc[i, column1]
+                    val2 = df.iloc[i, column2]
+                    if pd.notna(val1) and pd.notna(val2) and val1.strip() and val2.strip():
+                        # 尝试转换为浮点数
+                        float(val1)
+                        float(val2)
+                        data_start_row = i
+                        break
+                except (ValueError, TypeError):
+                    continue
+            
+            # 重新读取数据并转换为数值
+            data = pd.read_csv(file_path, header=None, skiprows=data_start_row, 
+                            usecols=[column1, column2], dtype=str)
+            
+            return self._clean_dataframe(data)
+            
+        except Exception as e:
+            print(f"Pandas读取失败，尝试手动解析: {e}")
+            return None
+
+    def _clean_dataframe(self, df):
+        """清理数据框"""
+        df = df.apply(pd.to_numeric, errors='coerce')
+        df = df.dropna()
+        return df.values if not df.empty else None
+
     def load_file_data(self, file_path):
         """加载文件数据到缓存，确保数据为数值类型"""
         try:
@@ -836,80 +1192,27 @@ class mainWindow(QMainWindow, main_window):
             
             if self.comboBox_10.currentText() == '自动':
                 if file_path.lower().endswith(('.txt', '.csv')):
-                    try:
-                        # 使用pandas读取，指定数据类型为数值
-                        df = pd.read_csv(file_path, header=None, dtype=str)  # 先读为字符串
-                        
-                        # 查找数据开始行
-                        data_start_row = 0
-                        for i in range(len(df)):
-                            try:
-                                val1 = df.iloc[i, column1]
-                                val2 = df.iloc[i, column2]
-                                if pd.notna(val1) and pd.notna(val2) and val1.strip() and val2.strip():
-                                    # 尝试转换为浮点数
-                                    float(val1)
-                                    float(val2)
-                                    data_start_row = i
-                                    break
-                            except (ValueError, TypeError):
-                                continue
-                        
-                        # 重新读取数据并转换为数值
-                        data = pd.read_csv(file_path, header=None, skiprows=data_start_row, 
-                                        usecols=[column1, column2], dtype=str)
-                        
-                        # 清理数据：移除空值并转换为数值
-                        data = data.dropna()
-                        
-                        # 转换为数值类型，无法转换的设为NaN
-                        data = data.apply(pd.to_numeric, errors='coerce')
-                        
-                        # 移除包含NaN的行
-                        data = data.dropna()
-                        
-                        # 转换为numpy数组
-                        data = data.values
-                        
-                        print(f"加载数据形状: {data.shape}, 数据类型: {data.dtype}")
-                        
-                        self.file_data_cache[file_path] = data
-                        return True
-                        
-                    except Exception as e:
-                        print(f"Pandas读取失败，尝试手动解析: {e}")
-                        return self._load_file_manually(file_path, column1, column2, None)
+                    data = self._load_text_data_auto(file_path, column1, column2)
+                    if data is None:
+                        data = self._load_file_manually(file_path, column1, column2, None)
                 
                 elif file_path.lower().endswith(('.xlsx', '.xls')):
-                    try:
-                        data = pd.read_excel(file_path).iloc[:, [column1, column2]]
-                        data = data.apply(pd.to_numeric, errors='coerce')
-                        data = data.dropna()
-                        data = data.values
-                        self.file_data_cache[file_path] = data
-                        return True
-                    except Exception as e:
-                        print(f"Excel读取失败: {e}")
-                        return False
+                    data = self._load_excel_data(file_path, column1, column2)
             
             elif self.comboBox_10.currentText() == '行':
                 data_start_row = int(self.lineEdit_8.text()) - 1
                 if file_path.lower().endswith(('.txt', '.csv')):
-                    return self._load_file_manually(file_path, column1, column2, data_start_row)
+                    data = self._load_file_manually(file_path, column1, column2, data_start_row)
                 elif file_path.lower().endswith(('.xlsx', '.xls')):
-                    try:
-                        data = pd.read_excel(file_path, skiprows=data_start_row).iloc[:, [column1, column2]]
-                        data = data.apply(pd.to_numeric, errors='coerce')
-                        data = data.dropna()
-                        data = data.values
-                        self.file_data_cache[file_path] = data
-                        return True
-                    except Exception as e:
-                        print(f"Excel读取失败: {e}")
-                        return False
+                    data = self._load_excel_data(file_path, column1, column2, data_start_row)
             
-            return False
-            
+            if data is not None:
+                print(f"加载数据形状: {data.shape}, 数据类型: {data.dtype}")
+                self.file_data_cache[file_path] = data
+                return True
+            else:
+                return False
+                
         except Exception as e:
             print(f"加载文件 {file_path} 出错: {str(e)}")
             traceback.print_exc()
@@ -950,18 +1253,17 @@ class mainWindow(QMainWindow, main_window):
             
             if not valid_data:
                 print(f"文件 {file_path} 中没有找到有效数据")
-                return False
+                return None
             
             # 转换为numpy数组并确保为浮点类型
             data = np.array(valid_data, dtype=float)
             print(f"手动加载数据形状: {data.shape}, 数据类型: {data.dtype}")
             
-            self.file_data_cache[file_path] = data
-            return True
+            return data
             
         except Exception as e:
             print(f"手动解析文件 {file_path} 出错: {str(e)}")
-            return False
+            return None
 
     def _is_data_line(self, line, column1, column2):
         """检查行是否是有效的数据行"""
@@ -1030,10 +1332,35 @@ class mainWindow(QMainWindow, main_window):
             print(f"无法转换的数据: '{parts[column1]}', '{parts[column2]}' - 错误: {e}")
             return None
 
-    def closeEvent(self, event):
-        """重写关闭事件，保存当前设置"""
-        self.save_current_settings()
-        event.accept()
+    def create_progress_dialog(self, title, message, maximum=0):
+        """创建进度对话框 - 修复动画显示"""
+        progress = QtWidgets.QProgressDialog(message, "取消", 0, maximum, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)  # 立即显示
+        
+        if maximum == 0:  # 不确定进度
+            progress.setCancelButton(None)  # 移除取消按钮
+            
+        # 强制显示
+        progress.show()
+        progress.setValue(0)
+        QtWidgets.QApplication.processEvents()
+        
+        return progress
+
+    def update_progress(self, progress, value, message=None):
+        """更新进度 - 修复动画显示"""
+        if message:
+            progress.setLabelText(message)
+        if value >= 0:
+            progress.setValue(value)
+        
+        # 强制重绘以确保动画显示
+        progress.repaint()
+        QtWidgets.QApplication.processEvents()
+        
+        return not progress.wasCanceled()
 
     def data_range(self, x, y_data):
         # 确保输入是numpy数组
@@ -1064,16 +1391,15 @@ class mainWindow(QMainWindow, main_window):
         # 计算vrange（基于时间筛选后的数据）
         vrange = np.max(y_filtered) - np.min(y_filtered)
         
-        # 处理最大值条件 - 将最大值点设为起点（时间0点）
+        # 处理最大值条件 - 仅保留从最大值点开始的数据（不移动x轴）
         if self.lineEdit_4.text():
             if self.lineEdit_4.text().lower() == '最大值':
                 max_idx = np.argmax(y_filtered)
                 x_filtered = x_filtered[max_idx:]
                 y_filtered = y_filtered[max_idx:]
-                time_offset = x_filtered[0]
-                x_filtered = x_filtered - time_offset
+                # 已删除时间偏移调整代码
         
-        # 处理最小值条件 - 将最小值点设为终点
+        # 处理最小值条件 - 保留到最小值点为止的数据
         if self.lineEdit_3.text():
             if self.lineEdit_3.text().lower() == '最小值':
                 min_idx = np.argmin(y_filtered)
@@ -1104,18 +1430,30 @@ class mainWindow(QMainWindow, main_window):
         if len(y_filtered) > 0:
             print('y 起始值:', y_filtered[0])
         if len(x_filtered) > 0:
-            print('x 起始值:', f'{x_filtered[0]:.20f}')
-        if len(y_filtered) > 0:
-            print('y 终点:', y_filtered[-1])
-        if len(x_filtered) > 0:
-            print('x 终点:', f'{x_filtered[-1]:.20f}')
-        print(f"x_filtered数据形状: {x_filtered.shape}, 数据类型: {x_filtered.dtype}")
-        print(f"y_filtered数据形状: {y_filtered.shape}, 数据类型: {y_filtered.dtype}")
-为什么时间筛选后的x起始值是0.000000001，x终点0.0000674，在全部执行完后，x起始值为0，x终点
+            print('x 起始值:', x_filtered[0])
+
         return x_filtered, y_filtered
 
-    def calculate_decay(self, item=None):
-        """计算衰减参数 - 支持有参数和无参数调用"""
+    def calculate_decay(self, item=None, show_progress=True):
+        """计算衰减参数 - 支持有参数和无参数调用
+        show_progress: 是否显示进度对话框，批量处理时不显示
+        """
+        progress = None
+        if show_progress:
+            # 创建进度对话框 - 仅当需要显示时创建
+            progress = QtWidgets.QProgressDialog("正在计算衰减参数...", "取消", 0, 0, self)
+            progress.setWindowTitle("处理中")
+            progress.setWindowModality(QtCore.Qt.WindowModal)
+            progress.setMinimumDuration(0)  # 立即显示
+            progress.setCancelButton(None)  # 移除取消按钮，防止用户中断重要计算
+            progress.show()
+            
+            # 强制显示进度对话框
+            progress.setValue(0)
+            
+            # 处理事件，确保界面更新
+            QtWidgets.QApplication.processEvents()
+        
         try:
             # 如果没有传递item参数，使用当前选中的项目
             if item is None:
@@ -1126,31 +1464,63 @@ class mainWindow(QMainWindow, main_window):
                         current_item = self.treeWidget.topLevelItem(0)
                     else:
                         QMessageBox.warning(self, "警告", "没有可处理的文件")
-                        return
+                        if progress:
+                            progress.close()
+                        return False
                 file_path = current_item.data(0, QtCore.Qt.UserRole)
             else:
-                file_path = item.data(0, QtCore.Qt.UserRole)
+                # 确保item是QTreeWidgetItem类型，而不是布尔值
+                if isinstance(item, bool):
+                    # 如果是布尔值，使用当前选中的项目
+                    current_item = self.treeWidget.currentItem()
+                    if current_item is None:
+                        if self.treeWidget.topLevelItemCount() > 0:
+                            current_item = self.treeWidget.topLevelItem(0)
+                        else:
+                            QMessageBox.warning(self, "警告", "没有可处理的文件")
+                            if progress:
+                                progress.close()
+                            return False
+                    file_path = current_item.data(0, QtCore.Qt.UserRole)
+                else:
+                    file_path = item.data(0, QtCore.Qt.UserRole)
+            
+            file_name = os.path.basename(file_path)
+            
+            if progress:
+                # 更新进度显示
+                progress.setLabelText(f"正在处理: {file_name}\n请稍候...")
+                progress.repaint()  # 强制重绘
+                QtWidgets.QApplication.processEvents()
             
             print(f"处理文件: {file_path}")
             
             self.file_path = file_path
 
-            # 清理之前的图形和状态
-            self.figure.clear()
-            self.figure2.clear()
-            self.figure3.clear()
+            if progress:
+                progress.setLabelText("清理图形...")
+                progress.repaint()
+                QtWidgets.QApplication.processEvents()
+            
+            self.clear_figures()
             
             # 重置相关变量
             self.result = None
             self.lifetime = None
 
-            # 强制重新加载文件数据，避免缓存问题
+            if progress:
+                progress.setLabelText("加载文件数据...")
+                progress.repaint()
+                QtWidgets.QApplication.processEvents()
+            
             if file_path in self.file_data_cache:
                 del self.file_data_cache[file_path]
                 
             if not self.load_file_data(file_path):
                 QMessageBox.warning(self, "错误", f"无法加载文件数据: {os.path.basename(file_path)}")
-                return
+                if progress:
+                    progress.close()
+                return False
             
             data = self.file_data_cache[file_path]
             print(f"数据形状: {data.shape}, 数据类型: {data.dtype}")
@@ -1158,11 +1528,15 @@ class mainWindow(QMainWindow, main_window):
             # 数据验证
             if len(data.shape) != 2 or data.shape[1] < 2:
                 QMessageBox.warning(self, "错误", f"数据格式不正确，期望至少2列，实际形状: {data.shape}")
-                return
+                if progress:
+                    progress.close()
+                return False
             
             if len(data) == 0:
                 QMessageBox.warning(self, "错误", "文件为空或没有有效数据")
-                return
+                if progress:
+                    progress.close()
+                return False
             
             # 确保数据为数值类型
             if data.dtype.kind not in 'buifc':  # 检查是否为数值类型
@@ -1177,7 +1551,11 @@ class mainWindow(QMainWindow, main_window):
             except:
                 print(f"数据范围 - x: [{np.min(t_data)}, {np.max(t_data)}], y: [{np.min(y_data)}, {np.max(y_data)}]")
             
-            # 绘制原始数据图形
+            if progress:
+                progress.setLabelText("绘制原始数据...")
+                progress.repaint()
+                QtWidgets.QApplication.processEvents()
+            
             ax = self.figure.add_subplot(111)
             x_label = self.comboBox_7.currentText() if self.comboBox.currentText() else "X轴"
             
@@ -1187,16 +1565,28 @@ class mainWindow(QMainWindow, main_window):
             ax.set_title(f'原始数据 - {os.path.basename(file_path)}')
             ax.grid(True)
             
+            self.figure.tight_layout()
             self.canvas.draw()
             
-            # 进行拟合计算
+            if progress:
+                progress.setLabelText("进行曲线拟合...\n这可能需要一些时间")
+                progress.repaint()
+                QtWidgets.QApplication.processEvents()
+            
             self._perform_fitting(data, file_path)
             
+            if progress:
+                progress.close()
+            return True
+            
         except Exception as e:
+            if progress:
+                progress.close()
             error_msg = f"处理文件时出错: {str(e)}"
             print(error_msg)
             traceback.print_exc()
             QMessageBox.critical(self, "错误", error_msg)
+            return False
 
     def _perform_fitting(self, data, file_path):
         """执行拟合计算的内部方法"""
@@ -1208,41 +1598,11 @@ class mainWindow(QMainWindow, main_window):
             fitter = MATLABCurveFitter()
 
             # 配置拟合选项
-            robust_mapping = {
-                'Off': RobustMethod.OFF,
-                'LAR': RobustMethod.LAR,
-                'Bisquare': RobustMethod.BISQUARE
-            }
+            fitter = self._setup_fitter_options(fitter)
 
-            algorithm_mapping = {
-                'Levenberg-Marquardt': Algorithm.LEVENBERG_MARQUARDT,
-                'Trust-Region': Algorithm.TRUST_REGION,
-            }
-
-            robust_choice = self.comboBox_8.currentText()
-            robust_method = robust_mapping.get(robust_choice, RobustMethod.OFF)
-
-            algorithm_choice = self.comboBox_9.currentText()
-            algorithm_method = algorithm_mapping.get(algorithm_choice, Algorithm.LEVENBERG_MARQUARDT)
-
-            # 设置高级选项（添加错误处理）
-            try:
-                fitter.set_options(
-                    Robust=robust_method,
-                    Algorithm=algorithm_method,
-                    DiffMinChange=float(self.lineEdit_19.text() or "1e-8"),
-                    DiffMaxChange=float(self.lineEdit_20.text() or "0.1"),
-                    MaxIter=int(self.lineEdit_21.text() or "400"),
-                    MaxFunEvals=int(self.lineEdit_22.text() or "600"),
-                    TolFun=float(self.lineEdit_23.text() or "1e-6"),
-                    TolX=float(self.lineEdit_24.text() or "1e-6")
-                )
-            except ValueError as e:
-                print(f"拟合参数设置错误，使用默认值: {e}")
-                # 使用默认值继续
-
-            # 获取模型类型
-            models_to_test = self.comboBox.currentText()
+            # 获取模型类型并保存到实例变量中
+            self.current_model_type = self.comboBox.currentText()
+            models_to_test = self.current_model_type
             print(f"使用模型: {models_to_test}")
 
             # 数据范围筛选
@@ -1269,9 +1629,38 @@ class mainWindow(QMainWindow, main_window):
             traceback.print_exc()
             QMessageBox.critical(self, "错误", error_msg)
 
+    def _setup_fitter_options(self, fitter):
+        """设置拟合器选项"""
+        robust_mapping = {
+            'Off': RobustMethod.OFF,
+            'LAR': RobustMethod.LAR,
+            'Bisquare': RobustMethod.BISQUARE
+        }
+
+        algorithm_mapping = {
+            'Levenberg-Marquardt': Algorithm.LEVENBERG_MARQUARDT,
+            'Trust-Region': Algorithm.TRUST_REGION,
+        }
+
+        robust_method = robust_mapping.get(self.comboBox_8.currentText(), RobustMethod.OFF)
+        algorithm_method = algorithm_mapping.get(self.comboBox_9.currentText(), Algorithm.LEVENBERG_MARQUARDT)
+        
+        fit_options = self.get_fit_options()
+        
+        fitter.set_options(
+            Robust=robust_method,
+            Algorithm=algorithm_method,
+            **fit_options
+        )
+        
+        return fitter
+
     def _handle_fit_result(self, result, models_to_test, Origional_x, Origional_y_data, x, y_data, fitter):
         """处理拟合结果"""
         try:
+            # 确保模型类型信息被保存
+            self.current_model_type = models_to_test
+            
             if models_to_test == '单指数':
                 b = result.params[1]
                 lifetime = -1/b if b != 0 else float('inf')
@@ -1280,23 +1669,27 @@ class mainWindow(QMainWindow, main_window):
                 print(f"单指数拟合结果: lifetime = {lifetime:.6f}")
 
             elif models_to_test == '双指数':
-            # 获取系数b和d (对应两个衰减速率)
-                a = result.params[0] if result.params[3] > result.params[1] else result.params[2]
-                b = result.params[1] if result.params[3] > result.params[1] else result.params[3] # 第一个衰减速率
-                c = result.params[2] if result.params[3] > result.params[1] else result.params[0]
-                d = result.params[3] if result.params[3] > result.params[1] else result.params[1] # 第二个衰减速率            
-                # 计算两个寿命
-                tau1 = -1/b if b != 0 else float('inf')
-                tau2 = -1/d if d != 0 else float('inf')
+                # 修复参数排序逻辑，确保 t1 < t2
+                a, t1, c, t2, e = result.params
                 
-                # 在界面上显示
-                self.lineEdit_27.setText(f"{a:.10f}")
-                self.lineEdit.setText(f"{tau1:.10f}")
-                self.lineEdit_26.setText(f"{c:.10f}")
-                self.lineEdit_28.setText(f"{tau2:.10f}")
-                self.lineEdit_29.setText(f"{result.params[4]:.10f}")     
+                # 如果 t2 < t1，交换两个分量的参数
+                if t2 < t1:
+                    # 交换快速分量和慢速分量
+                    a, c = c, a  # 交换振幅
+                    t1, t2 = t2, t1  # 交换时间常数
+                    print(f"参数已交换: t1={t1:.6f}, t2={t2:.6f}")
                 
-                print(f"双指数拟合结果: tau1 = {tau1:.10f}, tau2 = {tau2:.10f}")
+                # 更新界面显示（确保 t1 < t2）
+                self.lineEdit_27.setText(f"{a:.10f}")  # 快速分量振幅
+                self.lineEdit.setText(f"{t1:.10f}")    # 快速衰减时间常数 (t1)
+                self.lineEdit_26.setText(f"{c:.10f}")  # 慢速分量振幅
+                self.lineEdit_28.setText(f"{t2:.10f}") # 慢速衰减时间常数 (t2)
+                self.lineEdit_29.setText(f"{e:.10f}")  # 基线
+                
+                # 同时更新result.params以确保保存时使用正确的顺序
+                result.params = [a, t1, c, t2, e]
+                
+                print(f"双指数拟合结果: t1 = {t1:.10f}, t2 = {t2:.10f}, 振幅1 = {a:.10f}, 振幅2 = {c:.10f}")
 
             # 更新统计信息
             self.lineEdit_30.setText(f"{result.sse:.10f}")
@@ -1305,9 +1698,10 @@ class mainWindow(QMainWindow, main_window):
             self.lineEdit_32.setText(f"{result.rmse:.10f}")
             self.lineEdit_33.setText(f"{'是' if result.success else '否'}")
 
-            # 绘制结果
+            # 绘制结果 - 保持原有绘图逻辑
             model_def = fitter._get_model_definition(models_to_test)
             if model_def:
+                # 使用原始的参数顺序进行绘图，不应用交换
                 y_pred = model_def['function'](x, *result.params)
                 self.fig1fig2_plot(Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test)
             
@@ -1320,6 +1714,7 @@ class mainWindow(QMainWindow, main_window):
 
     def fig1fig2_plot(self, Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test):
         # 绘制图形
+        self.figure2.clear()
         ax2 = self.figure2.add_subplot(111)
 
         # 绘制所有数据点
@@ -1330,28 +1725,35 @@ class mainWindow(QMainWindow, main_window):
         ax2.plot(x, y_pred, 'r-', label=f'{models_to_test}拟合', linewidth=2)
         ax2.legend()
         ax2.set_title(f'{models_to_test}模型拟合结果')
-        ax2.grid(True, alpha=0.3)    
+        ax2.set_xlabel('时间')
+        ax2.set_ylabel("相对强度")
+        ax2.grid(True, alpha=0.3)
+        
+        # 自动调整布局
+        self.figure2.tight_layout()
         self.canvas2.draw()
 
         # 绘制残差
+        self.figure3.clear()
         ax3 = self.figure3.add_subplot(111)
+        
         ax3.plot(x, self.result.residuals, 'ro-', alpha=0.6, markersize=2)
         ax3.axhline(y=0, color='k', linestyle='--')
         ax3.set_title('残差图')
         ax3.set_xlabel('x')
         ax3.set_ylabel('残差')
         ax3.grid(True, alpha=0.3)
+        
+        # 自动调整布局
+        self.figure3.tight_layout()
         self.canvas3.draw()
-
-    
+        
     def calculate_lifetime(self):
         """使用线性外推方法计算温度"""
         try:
             if self.lifetime == None:
                 message="拟合失败！"
             tau_to_interpolate = self.lifetime * 1000
-
-            
 
             # 检查数据有效性
             if len(self.temperature_calibration) != len(self.lifetime_calibration):
@@ -1406,6 +1808,22 @@ class mainWindow(QMainWindow, main_window):
     def validate_folder_path(self, path):
         """验证文件夹路径是否有效"""
         return QDir(path).exists()
+
+    def clear_figures(self):
+        """清除所有图形"""
+        for figure in [self.figure, self.figure2, self.figure3]:
+            figure.clear()
+
+    def cleanup(self):
+        """清理资源"""
+        self.file_data_cache.clear()
+        self.clear_figures()
+        self.save_current_settings()
+
+    def closeEvent(self, event):
+        """重写关闭事件"""
+        self.cleanup()
+        event.accept()
 
 if __name__ == '__main__':
     QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)

@@ -137,26 +137,6 @@
               </property>
              </widget>
             </item>
-            <item>
-             <widget class="QLabel" name="label">
-              <property name="text">
-               <string>设置图片保存路径</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QPushButton" name="pushButton_4">
-              <property name="maximumSize">
-               <size>
-                <width>200</width>
-                <height>16777215</height>
-               </size>
-              </property>
-              <property name="text">
-               <string>设置图片保存路径</string>
-              </property>
-             </widget>
-            </item>
            </layout>
           </widget>
          </item>
@@ -265,15 +245,15 @@
              </size>
             </property>
             <property name="currentIndex">
-             <number>1</number>
+             <number>3</number>
             </property>
             <widget class="QWidget" name="page">
              <property name="geometry">
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>376</width>
-               <height>146</height>
+               <width>313</width>
+               <height>77</height>
               </rect>
              </property>
              <attribute name="label">
@@ -439,7 +419,7 @@
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>376</width>
+               <width>271</width>
                <height>185</height>
               </rect>
              </property>
@@ -670,8 +650,8 @@
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>376</width>
-               <height>146</height>
+               <width>300</width>
+               <height>115</height>
               </rect>
              </property>
              <attribute name="label">
@@ -776,7 +756,7 @@
                    </sizepolicy>
                   </property>
                   <property name="text">
-                   <string>1e-8</string>
+                   <string>1e-9</string>
                   </property>
                  </widget>
                 </item>
@@ -822,7 +802,7 @@
                    </sizepolicy>
                   </property>
                   <property name="text">
-                   <string>1e-10</string>
+                   <string>1e-12</string>
                   </property>
                  </widget>
                 </item>
@@ -926,7 +906,7 @@
                    </sizepolicy>
                   </property>
                   <property name="text">
-                   <string>1e-6</string>
+                   <string>1e-8</string>
                   </property>
                  </widget>
                 </item>
@@ -959,7 +939,7 @@
                    </sizepolicy>
                   </property>
                   <property name="text">
-                   <string>1e-10</string>
+                   <string>1e-12</string>
                   </property>
                  </widget>
                 </item>
@@ -972,7 +952,7 @@
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>376</width>
+               <width>218</width>
                <height>194</height>
               </rect>
              </property>
@@ -1397,15 +1377,15 @@ p, li { white-space: pre-wrap; }
           <item>
            <widget class="QToolBox" name="toolBox_2">
             <property name="currentIndex">
-             <number>0</number>
+             <number>1</number>
             </property>
             <widget class="QWidget" name="page_6">
              <property name="geometry">
               <rect>
                <x>0</x>
-               <y>0</y>
-               <width>376</width>
-               <height>196</height>
+               <y>-36</y>
+               <width>355</width>
+               <height>172</height>
               </rect>
              </property>
              <attribute name="label">
@@ -1569,7 +1549,7 @@ p, li { white-space: pre-wrap; }
                <x>0</x>
                <y>0</y>
                <width>376</width>
-               <height>196</height>
+               <height>141</height>
               </rect>
              </property>
              <attribute name="label">
