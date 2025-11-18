@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1363</width>
-    <height>863</height>
+    <width>1488</width>
+    <height>913</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -226,7 +226,7 @@
            <x>0</x>
            <y>0</y>
            <width>398</width>
-           <height>837</height>
+           <height>887</height>
           </rect>
          </property>
          <layout class="QVBoxLayout" name="verticalLayout_6">
@@ -245,15 +245,15 @@
              </size>
             </property>
             <property name="currentIndex">
-             <number>3</number>
+             <number>4</number>
             </property>
             <widget class="QWidget" name="page">
              <property name="geometry">
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>313</width>
-               <height>77</height>
+               <width>376</width>
+               <height>146</height>
               </rect>
              </property>
              <attribute name="label">
@@ -419,7 +419,7 @@
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>271</width>
+               <width>376</width>
                <height>185</height>
               </rect>
              </property>
@@ -650,8 +650,8 @@
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>300</width>
-               <height>115</height>
+               <width>376</width>
+               <height>171</height>
               </rect>
              </property>
              <attribute name="label">
@@ -706,7 +706,7 @@
              <property name="geometry">
               <rect>
                <x>0</x>
-               <y>0</y>
+               <y>-11</y>
                <width>355</width>
                <height>281</height>
               </rect>
@@ -952,7 +952,7 @@
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>218</width>
+               <width>376</width>
                <height>194</height>
               </rect>
              </property>
@@ -1352,40 +1352,54 @@ p, li { white-space: pre-wrap; }
            </widget>
           </item>
           <item>
-           <widget class="QLabel" name="label_10">
-            <property name="maximumSize">
-             <size>
-              <width>70</width>
-              <height>16777215</height>
-             </size>
+           <layout class="QHBoxLayout" name="horizontalLayout">
+            <property name="topMargin">
+             <number>0</number>
             </property>
-            <property name="text">
-             <string>是否收敛</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QLineEdit" name="lineEdit_33">
-            <property name="sizePolicy">
-             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
-              <horstretch>0</horstretch>
-              <verstretch>0</verstretch>
-             </sizepolicy>
-            </property>
-           </widget>
+            <item>
+             <widget class="QPushButton" name="pushButton_4">
+              <property name="text">
+               <string>导入标定数据</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QLabel" name="label_10">
+              <property name="maximumSize">
+               <size>
+                <width>70</width>
+                <height>16777215</height>
+               </size>
+              </property>
+              <property name="text">
+               <string>是否收敛</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QLineEdit" name="lineEdit_33">
+              <property name="sizePolicy">
+               <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+                <horstretch>0</horstretch>
+                <verstretch>0</verstretch>
+               </sizepolicy>
+              </property>
+             </widget>
+            </item>
+           </layout>
           </item>
           <item>
            <widget class="QToolBox" name="toolBox_2">
             <property name="currentIndex">
-             <number>1</number>
+             <number>0</number>
             </property>
             <widget class="QWidget" name="page_6">
              <property name="geometry">
               <rect>
                <x>0</x>
-               <y>-36</y>
-               <width>355</width>
-               <height>172</height>
+               <y>0</y>
+               <width>376</width>
+               <height>253</height>
               </rect>
              </property>
              <attribute name="label">
@@ -1549,7 +1563,7 @@ p, li { white-space: pre-wrap; }
                <x>0</x>
                <y>0</y>
                <width>376</width>
-               <height>141</height>
+               <height>237</height>
               </rect>
              </property>
              <attribute name="label">

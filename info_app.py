@@ -502,6 +502,7 @@ class mainWindow(QMainWindow, main_window):
 
     def _connect_signals(self):
         """集中连接所有信号槽"""
+        # 现有连接...
         self.treeWidget.itemClicked.connect(self.calculate_decay)
         self.comboBox_10.currentIndexChanged.connect(self.comboBox_10_changed)
         self.comboBox.currentIndexChanged.connect(self.fit_curve_model)
@@ -526,6 +527,189 @@ class mainWindow(QMainWindow, main_window):
         
         # 寿命、温度计算
         self.pushButton_6.clicked.connect(self.calculate_decay)
+        
+        # 新增：导入标定数据
+        self.pushButton_4.clicked.connect(self.import_calibration_data)
+    
+    def import_calibration_data(self):
+        """导入标定数据 - CSV格式，包含'温度,寿命'列，并在新窗口显示图像"""
+        try:
+            # 获取初始目录
+            initial_dir = self.pushButton.text() if self.pushButton.text() else QDir.homePath()
+            
+            # 打开文件选择对话框
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "导入标定数据",
+                initial_dir,
+                "CSV Files (*.csv);;All Files (*.*)"
+            )
+            
+            if not file_path:
+                return
+                
+            # 读取CSV文件
+            df = pd.read_csv(file_path)
+            
+            # 检查必要的列
+            required_columns = ['温度', '寿命']
+            if not all(col in df.columns for col in required_columns):
+                QMessageBox.warning(
+                    self, 
+                    "格式错误", 
+                    f"CSV文件必须包含列: {', '.join(required_columns)}\n"
+                    f"当前文件的列: {', '.join(df.columns.tolist())}"
+                )
+                return
+            
+            # 提取数据（单位保持为秒s）
+            temperatures = df['温度'].values
+            lifetimes = df['寿命'].values  # 单位：秒(s)
+            
+            # 验证数据
+            if len(temperatures) != len(lifetimes):
+                QMessageBox.warning(self, "数据错误", "温度和寿命数据长度不一致")
+                return
+                
+            if len(temperatures) == 0:
+                QMessageBox.warning(self, "数据错误", "没有找到有效数据")
+                return
+            
+            # 创建标定数据预览窗口（单位保持为秒s）
+            self.show_calibration_preview(temperatures, lifetimes, file_path)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "导入错误", f"导入标定数据时出错:\n{str(e)}")
+            print(f"导入标定数据错误: {str(e)}")
+            traceback.print_exc()
+            
+    def show_calibration_preview(self, temperatures, lifetimes, file_path):
+        """显示标定数据预览窗口"""
+        # 创建新窗口
+        self.calibration_window = QtWidgets.QDialog(self)
+        self.calibration_window.setWindowTitle("标定数据预览")
+        self.calibration_window.setMinimumSize(800, 600)
+        
+        # 创建布局
+        layout = QtWidgets.QVBoxLayout(self.calibration_window)
+        
+        # 添加文件信息标签
+        file_info = QtWidgets.QLabel(f"文件: {os.path.basename(file_path)}")
+        file_info.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        layout.addWidget(file_info)
+        
+        # 添加数据统计标签（使用科学计数法显示，单位：秒）
+        stats_text = (f"数据点数: {len(temperatures)} | "
+                    f"温度范围: {min(temperatures):.1f} - {max(temperatures):.1f} °C | "
+                    f"寿命范围: {min(lifetimes):.5e} - {max(lifetimes):.5e} s")
+        stats_label = QtWidgets.QLabel(stats_text)
+        stats_label.setStyleSheet("font-size: 10pt;")
+        layout.addWidget(stats_label)
+        
+        # 创建matplotlib图形
+        figure = Figure(figsize=(8, 3))
+        canvas = FC(figure)
+        toolbar = NavigationToolbar(canvas, self.calibration_window)
+        
+        # 绘制标定曲线
+        ax = figure.add_subplot(111)
+        
+        # 对数据进行排序以便连线
+        sorted_indices = np.argsort(lifetimes)
+        sorted_lifetimes = lifetimes[sorted_indices]
+        sorted_temperatures = temperatures[sorted_indices]
+        
+        # 绘制散点图
+        ax.scatter(lifetimes, temperatures, color='blue', s=50, alpha=0.7, label='标定数据点')
+        
+        # 单纯连线，不进行拟合
+        ax.plot(sorted_lifetimes, sorted_temperatures, 'r-', linewidth=2, label='数据连线')
+        
+        ax.set_xlabel('寿命 (s)')  # 修改为单位：秒
+        ax.set_ylabel('温度 (°C)')
+        ax.set_title('温度-寿命标定曲线')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 设置x轴为科学计数法格式
+        ax.ticklabel_format(style='sci', axis='x', scilimits=(0,0))
+        ax.xaxis.set_major_formatter(mpl.ticker.FormatStrFormatter('%.1e'))
+        
+        figure.tight_layout()
+        
+        # 添加matplotlib组件到布局
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas)
+        
+        # 添加数据表格
+        table_label = QtWidgets.QLabel("标定数据表:")
+        table_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(table_label)
+        
+        # 创建表格
+        table = QtWidgets.QTableWidget()
+        table.setRowCount(len(temperatures))
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(['温度 (°C)', '寿命 (s)'])  # 修改为单位：秒
+        
+        # 填充表格数据（使用科学计数法）
+        for i, (temp, life) in enumerate(zip(temperatures, lifetimes)):
+            table.setItem(i, 0, QtWidgets.QTableWidgetItem(f"{temp:.2f}"))
+            table.setItem(i, 1, QtWidgets.QTableWidgetItem(f"{life:.5e}"))
+        
+        table.setMaximumHeight(500)
+        table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        layout.addWidget(table)
+        
+        # 添加按钮区域
+        button_layout = QtWidgets.QHBoxLayout()
+        
+        # 确认导入按钮
+        confirm_button = QtWidgets.QPushButton("确认导入")
+        confirm_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
+        confirm_button.clicked.connect(lambda: self.confirm_calibration_import(temperatures, lifetimes))
+        
+        # 取消按钮
+        cancel_button = QtWidgets.QPushButton("取消")
+        cancel_button.setStyleSheet("QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 8px; }")
+        cancel_button.clicked.connect(self.calibration_window.reject)
+        
+        button_layout.addWidget(confirm_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+        
+        # 显示窗口
+        self.calibration_window.exec_()
+    
+    def confirm_calibration_import(self, temperatures, lifetimes):
+        """确认导入标定数据"""
+        try:
+            # 更新标定数据（单位：秒s）
+            self.temperature_calibration = temperatures.tolist()
+            self.lifetime_calibration = lifetimes.tolist()
+            
+            # 关闭预览窗口
+            if self.calibration_window:
+                self.calibration_window.accept()
+                self.calibration_window = None
+            
+            # 显示成功信息（使用科学计数法，单位：秒）
+            QMessageBox.information(
+                self, 
+                "导入成功", 
+                f"成功导入 {len(temperatures)} 个标定数据点\n"
+                f"温度范围: {min(temperatures):.2f} - {max(temperatures):.2f} °C\n"
+                f"寿命范围: {min(lifetimes):.5e} - {max(lifetimes):.5e} s"
+            )
+            
+            # 打印导入信息（使用科学计数法，单位：秒）
+            print(f"导入标定数据: {len(temperatures)} 个点")
+            print(f"温度: {temperatures}")
+            print(f"寿命 (s): [{min(lifetimes):.5e}, {max(lifetimes):.5e}]")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "导入错误", f"确认导入时出错:\n{str(e)}")
+            print(f"确认导入标定数据错误: {str(e)}")
 
     def _initialize_variables(self):
         """初始化实例变量"""
@@ -542,6 +726,11 @@ class mainWindow(QMainWindow, main_window):
         self.time_unit_5 = 1
         self.time_unit_6 = 1
         self.time_unit_7 = 1
+        
+        # 新增：标定数据相关变量
+        self.temperature_calibration = []
+        self.lifetime_calibration = []
+        self.calibration_window = None
 
     def _initialize_ui(self):
         """初始化UI组件"""
@@ -767,86 +956,98 @@ class mainWindow(QMainWindow, main_window):
 
     def set_download_directory(self):
         """打开文件夹选择对话框并更新lineEdit内容"""
-        initial_dir = self.pushButton_3.text() or QDir.homePath()
-        folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "选择数据保存路径",
-            initial_dir,
-            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-        )
+        try:
+            initial_dir = self.pushButton_3.text() or QDir.homePath()
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "选择数据保存路径",
+                initial_dir,
+                QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+            )
 
-        
-        if folder_path:
-            self.pushButton_3.setText(folder_path)
-            if self.validate_folder_path(folder_path):
-                print(f"有效路径: {folder_path}")
-                # 保存设置
-                self.save_current_settings()
-            else:
-                print("警告：路径不可访问")
-        
-        self.download_directory = self.pushButton_3.text()
+            
+            if folder_path:
+                self.pushButton_3.setText(folder_path)
+                if self.validate_folder_path(folder_path):
+                    print(f"有效路径: {folder_path}")
+                    # 保存设置
+                    self.save_current_settings()
+                else:
+                    print("警告：路径不可访问")
+            
+            self.download_directory = self.pushButton_3.text()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"设置保存目录时出错:\n{str(e)}")
 
     def set_img_directory(self):
         """打开文件夹选择对话框"""
-        initial_dir = self.pushButton_4.text() or QDir.homePath()
-        folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "选择图片保存路径",
-            initial_dir,
-            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-        )
+        try:
+            initial_dir = self.pushButton_4.text() or QDir.homePath()
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "选择图片保存路径",
+                initial_dir,
+                QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+            )
 
-        if folder_path:
-            self.pushButton_4.setText(folder_path)
-            if self.validate_folder_path(folder_path):
-                print(f"有效路径: {folder_path}")
-                # 保存设置
-                self.save_current_settings()
-            else:
-                print("警告：路径不可访问")
-        self.img_directory = self.pushButton_4.text()
+            if folder_path:
+                self.pushButton_4.setText(folder_path)
+                if self.validate_folder_path(folder_path):
+                    print(f"有效路径: {folder_path}")
+                    # 保存设置
+                    self.save_current_settings()
+                else:
+                    print("警告：路径不可访问")
+            self.img_directory = self.pushButton_4.text()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"设置图片目录时出错:\n{str(e)}")
     
     def save_current_settings(self):
         """保存当前的工作路径和文件列表到设置"""
-        # 保存工作路径
-        work_dir = self.pushButton.text()
-        if work_dir and os.path.exists(work_dir):
-            self.settings.setValue("last_work_directory", work_dir)
-        download_dir = self.pushButton_3.text()
-        if download_dir and os.path.exists(download_dir):
-            self.settings.setValue("last_download_directory", download_dir)        
+        try:
+            # 保存工作路径
+            work_dir = self.pushButton.text()
+            if work_dir and os.path.exists(work_dir):
+                self.settings.setValue("last_work_directory", work_dir)
+            download_dir = self.pushButton_3.text()
+            if download_dir and os.path.exists(download_dir):
+                self.settings.setValue("last_download_directory", download_dir)        
 
-        
-        # 保存文件列表
-        file_list = []
-        for i in range(self.treeWidget.topLevelItemCount()):
-            item = self.treeWidget.topLevelItem(i)
-            file_path = item.data(0, QtCore.Qt.UserRole)
-            if file_path and os.path.exists(file_path):
-                file_list.append(file_path)
-        
-        self.settings.setValue("last_file_list", file_list)
+            
+            # 保存文件列表
+            file_list = []
+            for i in range(self.treeWidget.topLevelItemCount()):
+                item = self.treeWidget.topLevelItem(i)
+                file_path = item.data(0, QtCore.Qt.UserRole)
+                if file_path and os.path.exists(file_path):
+                    file_list.append(file_path)
+            
+            self.settings.setValue("last_file_list", file_list)
+        except Exception as e:
+            print(f"保存设置时出错: {str(e)}")
 
     def set_work_directory(self):
         """打开文件夹选择对话框并更新lineEdit内容"""
-        initial_dir = self.pushButton.text() or QDir.homePath()
-        
-        folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "选择工作文件夹",
-            initial_dir,
-            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-        )
-        
-        if folder_path:
-            self.pushButton.setText(folder_path)
-            if self.validate_folder_path(folder_path):
-                print(f"有效路径: {folder_path}")
-                # 保存设置
-                self.save_current_settings()
-            else:
-                print("警告：路径不可访问")
+        try:
+            initial_dir = self.pushButton.text() or QDir.homePath()
+            
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "选择工作文件夹",
+                initial_dir,
+                QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+            )
+            
+            if folder_path:
+                self.pushButton.setText(folder_path)
+                if self.validate_folder_path(folder_path):
+                    print(f"有效路径: {folder_path}")
+                    # 保存设置
+                    self.save_current_settings()
+                else:
+                    print("警告：路径不可访问")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"设置工作目录时出错:\n{str(e)}")
                 
     def save_one(self):
         """保存当前文件的衰减计算结果到txt文件"""
@@ -886,6 +1087,16 @@ class mainWindow(QMainWindow, main_window):
                 QMessageBox.warning(self, "错误", f"处理文件 {file_name} 失败")
                 progress.close()
                 return
+            
+            # 如果有标定数据，计算温度
+            if (hasattr(self, 'temperature_calibration') and self.temperature_calibration and
+                hasattr(self, 'lifetime_calibration') and self.lifetime_calibration):
+                try:
+                    avg_lifetime = self.calculate_average_lifetime()
+                    if avg_lifetime is not None:
+                        self.calculate_temperature_by_interpolation(avg_lifetime)
+                except Exception as e:
+                    print(f"保存前计算温度时出错: {str(e)}")
             
             # 收集拟合结果
             result_data = self._create_result_data(file_name)
@@ -972,12 +1183,11 @@ class mainWindow(QMainWindow, main_window):
             
             # 遍历所有文件
             for i in range(file_count):
-                # 处理事件，检查是否取消
-                QtWidgets.QApplication.processEvents()
-                if not progress_dialog.isVisible():
+                # 检查是否取消
+                if progress_dialog.wasCanceled():
                     cancelled = True
                     break
-                    
+                
                 item = self.treeWidget.topLevelItem(i)
                 file_path = item.data(0, QtCore.Qt.UserRole)
                 file_name = os.path.basename(file_path)
@@ -1002,6 +1212,18 @@ class mainWindow(QMainWindow, main_window):
                 if not success:
                     print(f"处理文件 {file_name} 失败")
                     continue
+                
+                # 如果有标定数据，计算温度
+                if (hasattr(self, 'temperature_calibration') and self.temperature_calibration and
+                    hasattr(self, 'lifetime_calibration') and self.lifetime_calibration):
+                    try:
+                        avg_lifetime = self.calculate_average_lifetime()
+                        if avg_lifetime is not None:
+                            self.calculate_temperature_by_interpolation(avg_lifetime)
+                    except Exception as e:
+                        print(f"保存前计算温度时出错: {str(e)}")
+                
+                print(f"平均寿命: {avg_lifetime}")
                 
                 # 收集拟合结果
                 result_data = self._create_result_data(file_name)
@@ -1050,8 +1272,22 @@ class mainWindow(QMainWindow, main_window):
         """创建结果数据结构"""
         if not (hasattr(self, 'result') and self.result and self.result.success):
             return None
-            
-        return {
+        
+        # 计算平均寿命
+        avg_lifetime = None
+        if hasattr(self, 'result') and self.result and self.result.success:
+            try:
+                avg_lifetime = self.calculate_average_lifetime()
+            except Exception as e:
+                print(f"计算平均寿命时出错: {str(e)}")
+                avg_lifetime = None
+        
+        # 使用已计算的温度（如果存在）
+        temperature = None
+        if hasattr(self, 'temperature'):
+            temperature = self.temperature
+        
+        result_data = {
             'file_name': file_name,
             'model_type': self.comboBox.currentText(),
             'params': self.result.params.copy() if self.result.params is not None else [],
@@ -1060,8 +1296,12 @@ class mainWindow(QMainWindow, main_window):
             'rsquare': self.result.rsquare,
             'adjrsquare': self.result.adjrsquare,
             'rmse': self.result.rmse,
-            'success': self.result.success
+            'success': self.result.success,
+            'avg_lifetime': avg_lifetime,  # 新增平均寿命
+            'temperature': temperature     # 温度
         }
+        
+        return result_data
 
     def _get_output_filename(self, base_name, directory):
         """生成输出文件名"""
@@ -1081,58 +1321,83 @@ class mainWindow(QMainWindow, main_window):
         # 添加拟合优度统计的列名
         header_parts.extend(["SSE", "R平方", "调整R平方", "RMSE", "拟合成功"])
         
+        # 添加平均寿命和温度列（最后两栏）
+        header_parts.append("平均寿命(s)")
+        
+        # 只要有标定数据就添加温度列
+        if (hasattr(self, 'temperature_calibration') and self.temperature_calibration and
+            hasattr(self, 'lifetime_calibration') and self.lifetime_calibration):
+            header_parts.append("温度(°C)")
+        
         return "\t".join(header_parts)
 
     def _format_result_line(self, result):
-        """格式化单行结果"""
+        """格式化单行结果，使用科学计数法"""
         line_parts = [
             result['file_name'],
             result['model_type']
         ]
         
-        # 添加系数估计的值
+        # 添加系数估计的值（使用科学计数法）
         if result['params'] is not None:
             for param_value in result['params']:
-                line_parts.append(f"{param_value:.10f}")
+                line_parts.append(f"{param_value:.5e}")
         
-        # 添加拟合优度统计的值
+        # 添加拟合优度统计的值（使用科学计数法）
         line_parts.extend([
-            f"{result['sse']:.10f}",
-            f"{result['rsquare']:.10f}",
-            f"{result['adjrsquare']:.10f}",
-            f"{result['rmse']:.10f}",
-            "是" if result['success'] else "否"
+            f"{result['sse']:.5e}",
+            f"{result['rsquare']:.5e}",
+            f"{result['adjrsquare']:.5e}",
+            f"{result['rmse']:.5e}",
+            "是" if result['success'] else "否"  # 拟合成功状态
         ])
         
+        # 添加平均寿命（使用科学计数法）
+        if result.get('avg_lifetime') is not None:
+            line_parts.append(f"{result['avg_lifetime']:.5e}")
+        else:
+            line_parts.append("N/A")
+        
+        # 添加温度值（如果有标定数据就包含这一列）
+        if (hasattr(self, 'temperature_calibration') and self.temperature_calibration and
+            hasattr(self, 'lifetime_calibration') and self.lifetime_calibration):
+            if result.get('temperature') is not None:
+                line_parts.append(f"{result['temperature']:.2f}")  # 温度保持2位小数
+            else:
+                line_parts.append("N/A")
+        
         return "\t".join(line_parts)
-    
+
     def select_target_files(self):
         """打开文件选择对话框，选择Excel/TXT/CSV文件并添加到treeWidget"""
-        initial_dir = self.pushButton.text() if self.pushButton.text() else QDir.homePath()
-        
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "选择目标文件",
-            initial_dir,
-            self._get_file_filters()
-        )
-        
-        if file_paths:
-            # 清空现有内容（可选，根据需要决定是否保留之前的内容）
-            self.treeWidget.clear()
+        try:
+            initial_dir = self.pushButton.text() if self.pushButton.text() else QDir.homePath()
             
-            for file_path in file_paths:
-                if self._validate_file_extension(file_path):
-                    self._create_tree_item(file_path)
-                else:
-                    QMessageBox.warning(self, "警告", f"忽略不支持的文件类型: {os.path.basename(file_path)}")
+            file_paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "选择目标文件",
+                initial_dir,
+                self._get_file_filters()
+            )
             
-            # 更新按钮文本显示已选择文件数量
-            selected_count = self.treeWidget.topLevelItemCount()
-            self.pushButton_2.setText(f"已选择 {selected_count} 个文件")
-            
-            # 保存设置
-            self.save_current_settings()
+            if file_paths:
+                # 清空现有内容（可选，根据需要决定是否保留之前的内容）
+                self.treeWidget.clear()
+                
+                for file_path in file_paths:
+                    if self._validate_file_extension(file_path):
+                        self._create_tree_item(file_path)
+                    else:
+                        QMessageBox.warning(self, "警告", f"忽略不支持的文件类型: {os.path.basename(file_path)}")
+                
+                # 更新按钮文本显示已选择文件数量
+                selected_count = self.treeWidget.topLevelItemCount()
+                self.pushButton_2.setText(f"已选择 {selected_count} 个文件")
+                
+                # 保存设置
+                self.save_current_settings()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"选择文件时出错:\n{str(e)}")
         
     def _load_excel_data(self, file_path, column1, column2, data_start_row=None):
         """加载Excel数据"""
@@ -1187,8 +1452,16 @@ class mainWindow(QMainWindow, main_window):
     def load_file_data(self, file_path):
         """加载文件数据到缓存，确保数据为数值类型"""
         try:
-            column1 = int(self.lineEdit_9.text()) - 1
-            column2 = int(self.lineEdit_10.text()) - 1
+            # 验证列设置
+            try:
+                column1 = int(self.lineEdit_9.text()) - 1
+                column2 = int(self.lineEdit_10.text()) - 1
+                if column1 < 0 or column2 < 0:
+                    QMessageBox.warning(self, "警告", "列号必须为正整数")
+                    return False
+            except ValueError:
+                QMessageBox.warning(self, "警告", "列号必须为有效数字")
+                return False
             
             if self.comboBox_10.currentText() == '自动':
                 if file_path.lower().endswith(('.txt', '.csv')):
@@ -1200,7 +1473,15 @@ class mainWindow(QMainWindow, main_window):
                     data = self._load_excel_data(file_path, column1, column2)
             
             elif self.comboBox_10.currentText() == '行':
-                data_start_row = int(self.lineEdit_8.text()) - 1
+                try:
+                    data_start_row = int(self.lineEdit_8.text()) - 1
+                    if data_start_row < 0:
+                        QMessageBox.warning(self, "警告", "起始行必须为正整数")
+                        return False
+                except ValueError:
+                    QMessageBox.warning(self, "警告", "起始行必须为有效数字")
+                    return False
+                    
                 if file_path.lower().endswith(('.txt', '.csv')):
                     data = self._load_file_manually(file_path, column1, column2, data_start_row)
                 elif file_path.lower().endswith(('.xlsx', '.xls')):
@@ -1211,10 +1492,13 @@ class mainWindow(QMainWindow, main_window):
                 self.file_data_cache[file_path] = data
                 return True
             else:
+                QMessageBox.warning(self, "警告", f"无法从文件 {os.path.basename(file_path)} 中读取有效数据")
                 return False
                 
         except Exception as e:
-            print(f"加载文件 {file_path} 出错: {str(e)}")
+            error_msg = f"加载文件 {file_path} 出错: {str(e)}"
+            print(error_msg)
+            QMessageBox.critical(self, "错误", error_msg)
             traceback.print_exc()
             return False
          
@@ -1363,76 +1647,81 @@ class mainWindow(QMainWindow, main_window):
         return not progress.wasCanceled()
 
     def data_range(self, x, y_data):
-        # 确保输入是numpy数组
-        x = np.asarray(x)
-        y_data = np.asarray(y_data)
-        
-        # 初始化筛选条件（默认不筛选）
-        x_mask = np.ones_like(x, dtype=bool)
-        y_mask = np.ones_like(y_data, dtype=bool)
+        """数据范围筛选"""
+        try:
+            # 确保输入是numpy数组
+            x = np.asarray(x)
+            y_data = np.asarray(y_data)
+            
+            # 初始化筛选条件（默认不筛选）
+            x_mask = np.ones_like(x, dtype=bool)
+            y_mask = np.ones_like(y_data, dtype=bool)
 
-        # 处理时间范围筛选（x轴范围）
-        if self.lineEdit_2.text():  # x_min
-            x_min = float(self.lineEdit_2.text())
-            x_mask &= (x >= x_min)
+            # 处理时间范围筛选（x轴范围）
+            if self.lineEdit_2.text():  # x_min
+                x_min = float(self.lineEdit_2.text())
+                x_mask &= (x >= x_min)
 
-        if self.lineEdit_5.text():  # x_max
-            x_max = float(self.lineEdit_5.text())
-            x_mask &= (x <= x_max)
-        
-        # 应用时间筛选后的数据
-        x_filtered = x[x_mask]
-        y_filtered = y_data[x_mask]
-        
-        # 如果没有数据通过时间筛选，直接返回空数组
-        if len(x_filtered) == 0:
+            if self.lineEdit_5.text():  # x_max
+                x_max = float(self.lineEdit_5.text())
+                x_mask &= (x <= x_max)
+            
+            # 应用时间筛选后的数据
+            x_filtered = x[x_mask]
+            y_filtered = y_data[x_mask]
+            
+            # 如果没有数据通过时间筛选，直接返回空数组
+            if len(x_filtered) == 0:
+                return np.array([]), np.array([])
+            
+            # 计算vrange（基于时间筛选后的数据）
+            vrange = np.max(y_filtered) - np.min(y_filtered)
+            
+            # 处理最大值条件 - 仅保留从最大值点开始的数据（不移动x轴）
+            if self.lineEdit_4.text():
+                if self.lineEdit_4.text().lower() == '最大值':
+                    max_idx = np.argmax(y_filtered)
+                    x_filtered = x_filtered[max_idx:]
+                    y_filtered = y_filtered[max_idx:]
+                    # 已删除时间偏移调整代码
+            
+            # 处理最小值条件 - 保留到最小值点为止的数据
+            if self.lineEdit_3.text():
+                if self.lineEdit_3.text().lower() == '最小值':
+                    min_idx = np.argmin(y_filtered)
+                    x_filtered = x_filtered[:min_idx+1]
+                    y_filtered = y_filtered[:min_idx+1]
+            
+            # 处理百分比范围条件
+            if self.lineEdit_4.text() and self.lineEdit_4.text().lower() != '最大值':
+                try:
+                    y_max = float(self.lineEdit_4.text()) * vrange * 0.01
+                    mask = (y_filtered <= y_max)
+                    x_filtered = x_filtered[mask]
+                    y_filtered = y_filtered[mask]
+                except ValueError:
+                    pass
+            
+            if self.lineEdit_3.text() and self.lineEdit_3.text().lower() != '最小值':
+                try:
+                    y_min = float(self.lineEdit_3.text()) * vrange * 0.01
+                    mask = (y_filtered >= y_min)
+                    x_filtered = x_filtered[mask]
+                    y_filtered = y_filtered[mask]
+                except ValueError:
+                    pass
+            
+            # 保留您最初的调试信息
+            print('def data_range')
+            if len(y_filtered) > 0:
+                print('y 起始值:', y_filtered[0])
+            if len(x_filtered) > 0:
+                print('x 起始值:', x_filtered[0])
+
+            return x_filtered, y_filtered
+        except Exception as e:
+            print(f"数据范围筛选时出错: {str(e)}")
             return np.array([]), np.array([])
-        
-        # 计算vrange（基于时间筛选后的数据）
-        vrange = np.max(y_filtered) - np.min(y_filtered)
-        
-        # 处理最大值条件 - 仅保留从最大值点开始的数据（不移动x轴）
-        if self.lineEdit_4.text():
-            if self.lineEdit_4.text().lower() == '最大值':
-                max_idx = np.argmax(y_filtered)
-                x_filtered = x_filtered[max_idx:]
-                y_filtered = y_filtered[max_idx:]
-                # 已删除时间偏移调整代码
-        
-        # 处理最小值条件 - 保留到最小值点为止的数据
-        if self.lineEdit_3.text():
-            if self.lineEdit_3.text().lower() == '最小值':
-                min_idx = np.argmin(y_filtered)
-                x_filtered = x_filtered[:min_idx+1]
-                y_filtered = y_filtered[:min_idx+1]
-        
-        # 处理百分比范围条件
-        if self.lineEdit_4.text() and self.lineEdit_4.text().lower() != '最大值':
-            try:
-                y_max = float(self.lineEdit_4.text()) * vrange * 0.01
-                mask = (y_filtered <= y_max)
-                x_filtered = x_filtered[mask]
-                y_filtered = y_filtered[mask]
-            except ValueError:
-                pass
-        
-        if self.lineEdit_3.text() and self.lineEdit_3.text().lower() != '最小值':
-            try:
-                y_min = float(self.lineEdit_3.text()) * vrange * 0.01
-                mask = (y_filtered >= y_min)
-                x_filtered = x_filtered[mask]
-                y_filtered = y_filtered[mask]
-            except ValueError:
-                pass
-        
-        # 保留您最初的调试信息
-        print('def data_range')
-        if len(y_filtered) > 0:
-            print('y 起始值:', y_filtered[0])
-        if len(x_filtered) > 0:
-            print('x 起始值:', x_filtered[0])
-
-        return x_filtered, y_filtered
 
     def calculate_decay(self, item=None, show_progress=True):
         """计算衰减参数 - 支持有参数和无参数调用
@@ -1631,29 +1920,33 @@ class mainWindow(QMainWindow, main_window):
 
     def _setup_fitter_options(self, fitter):
         """设置拟合器选项"""
-        robust_mapping = {
-            'Off': RobustMethod.OFF,
-            'LAR': RobustMethod.LAR,
-            'Bisquare': RobustMethod.BISQUARE
-        }
+        try:
+            robust_mapping = {
+                'Off': RobustMethod.OFF,
+                'LAR': RobustMethod.LAR,
+                'Bisquare': RobustMethod.BISQUARE
+            }
 
-        algorithm_mapping = {
-            'Levenberg-Marquardt': Algorithm.LEVENBERG_MARQUARDT,
-            'Trust-Region': Algorithm.TRUST_REGION,
-        }
+            algorithm_mapping = {
+                'Levenberg-Marquardt': Algorithm.LEVENBERG_MARQUARDT,
+                'Trust-Region': Algorithm.TRUST_REGION,
+            }
 
-        robust_method = robust_mapping.get(self.comboBox_8.currentText(), RobustMethod.OFF)
-        algorithm_method = algorithm_mapping.get(self.comboBox_9.currentText(), Algorithm.LEVENBERG_MARQUARDT)
-        
-        fit_options = self.get_fit_options()
-        
-        fitter.set_options(
-            Robust=robust_method,
-            Algorithm=algorithm_method,
-            **fit_options
-        )
-        
-        return fitter
+            robust_method = robust_mapping.get(self.comboBox_8.currentText(), RobustMethod.OFF)
+            algorithm_method = algorithm_mapping.get(self.comboBox_9.currentText(), Algorithm.LEVENBERG_MARQUARDT)
+            
+            fit_options = self.get_fit_options()
+            
+            fitter.set_options(
+                Robust=robust_method,
+                Algorithm=algorithm_method,
+                **fit_options
+            )
+            
+            return fitter
+        except Exception as e:
+            print(f"设置拟合器选项时出错: {str(e)}")
+            return fitter
 
     def _handle_fit_result(self, result, models_to_test, Origional_x, Origional_y_data, x, y_data, fitter):
         """处理拟合结果"""
@@ -1680,22 +1973,22 @@ class mainWindow(QMainWindow, main_window):
                     print(f"参数已交换: t1={t1:.6f}, t2={t2:.6f}")
                 
                 # 更新界面显示（确保 t1 < t2）
-                self.lineEdit_27.setText(f"{a:.10f}")  # 快速分量振幅
-                self.lineEdit.setText(f"{t1:.10f}")    # 快速衰减时间常数 (t1)
-                self.lineEdit_26.setText(f"{c:.10f}")  # 慢速分量振幅
-                self.lineEdit_28.setText(f"{t2:.10f}") # 慢速衰减时间常数 (t2)
-                self.lineEdit_29.setText(f"{e:.10f}")  # 基线
+                self.lineEdit_27.setText(f"{a:.5e}")  # 快速分量振幅
+                self.lineEdit.setText(f"{t1:.5e}")    # 快速衰减时间常数 (t1)
+                self.lineEdit_26.setText(f"{c:.5e}")  # 慢速分量振幅
+                self.lineEdit_28.setText(f"{t2:.5e}") # 慢速衰减时间常数 (t2)
+                self.lineEdit_29.setText(f"{e:.5e}")  # 基线
                 
                 # 同时更新result.params以确保保存时使用正确的顺序
                 result.params = [a, t1, c, t2, e]
                 
-                print(f"双指数拟合结果: t1 = {t1:.10f}, t2 = {t2:.10f}, 振幅1 = {a:.10f}, 振幅2 = {c:.10f}")
+                print(f"双指数拟合结果: t1 = {t1:.5e}, t2 = {t2:.5e}, 振幅1 = {a:.5e}, 振幅2 = {c:.5e}")
 
             # 更新统计信息
-            self.lineEdit_30.setText(f"{result.sse:.10f}")
-            self.lineEdit_7.setText(f"{result.rsquare:.10f}")
-            self.lineEdit_31.setText(f"{result.adjrsquare:.10f}")
-            self.lineEdit_32.setText(f"{result.rmse:.10f}")
+            self.lineEdit_30.setText(f"{result.sse:.5e}")
+            self.lineEdit_7.setText(f"{result.rsquare:.5e}")
+            self.lineEdit_31.setText(f"{result.adjrsquare:.5e}")
+            self.lineEdit_32.setText(f"{result.rmse:.5e}")
             self.lineEdit_33.setText(f"{'是' if result.success else '否'}")
 
             # 绘制结果 - 保持原有绘图逻辑
@@ -1713,97 +2006,202 @@ class mainWindow(QMainWindow, main_window):
             traceback.print_exc()
 
     def fig1fig2_plot(self, Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test):
-        # 绘制图形
-        self.figure2.clear()
-        ax2 = self.figure2.add_subplot(111)
-
-        # 绘制所有数据点
-        ax2.scatter(Origional_x, Origional_y_data, alpha=0.3, color='gray', s=5)
-        # 高亮显示用于拟合的数据点
-        ax2.scatter(x, y_data, alpha=0.8, color='blue', s=10)
-        
-        ax2.plot(x, y_pred, 'r-', label=f'{models_to_test}拟合', linewidth=2)
-        ax2.legend()
-        ax2.set_title(f'{models_to_test}模型拟合结果')
-        ax2.set_xlabel('时间')
-        ax2.set_ylabel("相对强度")
-        ax2.grid(True, alpha=0.3)
-        
-        # 自动调整布局
-        self.figure2.tight_layout()
-        self.canvas2.draw()
-
-        # 绘制残差
-        self.figure3.clear()
-        ax3 = self.figure3.add_subplot(111)
-        
-        ax3.plot(x, self.result.residuals, 'ro-', alpha=0.6, markersize=2)
-        ax3.axhline(y=0, color='k', linestyle='--')
-        ax3.set_title('残差图')
-        ax3.set_xlabel('x')
-        ax3.set_ylabel('残差')
-        ax3.grid(True, alpha=0.3)
-        
-        # 自动调整布局
-        self.figure3.tight_layout()
-        self.canvas3.draw()
-        
-    def calculate_lifetime(self):
-        """使用线性外推方法计算温度"""
+        """绘制拟合结果图形"""
         try:
-            if self.lifetime == None:
-                message="拟合失败！"
-            tau_to_interpolate = self.lifetime * 1000
+            # 绘制图形
+            self.figure2.clear()
+            ax2 = self.figure2.add_subplot(111)
 
-            # 检查数据有效性
-            if len(self.temperature_calibration) != len(self.lifetime_calibration):
-                QMessageBox.warning(self, "警告", "温度-寿命校准数据长度不一致")
+            # 绘制所有数据点
+            ax2.scatter(Origional_x, Origional_y_data, alpha=0.3, color='gray', s=5)
+            # 高亮显示用于拟合的数据点
+            ax2.scatter(x, y_data, alpha=0.8, color='blue', s=10)
+            
+            ax2.plot(x, y_pred, 'r-', label=f'{models_to_test}拟合', linewidth=2)
+            ax2.legend()
+            ax2.set_title(f'{models_to_test}模型拟合结果')
+            ax2.set_xlabel('时间')
+            ax2.set_ylabel("相对强度")
+            ax2.grid(True, alpha=0.3)
+            
+            # 自动调整布局
+            self.figure2.tight_layout()
+            self.canvas2.draw()
+
+            # 绘制残差
+            self.figure3.clear()
+            ax3 = self.figure3.add_subplot(111)
+            
+            ax3.plot(x, self.result.residuals, 'ro-', alpha=0.6, markersize=2)
+            ax3.axhline(y=0, color='k', linestyle='--')
+            ax3.set_title('残差图')
+            ax3.set_xlabel('x')
+            ax3.set_ylabel('残差')
+            ax3.grid(True, alpha=0.3)
+            
+            # 自动调整布局
+            self.figure3.tight_layout()
+            self.canvas3.draw()
+            
+            self.calculate_lifetime()
+        except Exception as e:
+            print(f"绘图时出错: {str(e)}")
+            
+    def calculate_lifetime(self):
+        """使用线性插值和两侧外推方法计算温度，基于平均寿命"""
+        try:
+            # 检查是否有拟合结果
+            if self.result is None or not self.result.success:
+                QMessageBox.warning(self, "警告", "请先进行成功的拟合计算")
                 return
             
-            if len(self.temperature_calibration) < 2:
-                QMessageBox.warning(self, "警告", "温度-寿命校准数据点不足")
+            # 检查标定数据（修改为检查是否为空列表）
+            if not hasattr(self, 'temperature_calibration') or not self.temperature_calibration:
+                QMessageBox.warning(self, "警告", "请先导入标定数据")
                 return
             
-            import numpy as np
+            if not hasattr(self, 'lifetime_calibration') or not self.lifetime_calibration:
+                QMessageBox.warning(self, "警告", "请先导入标定数据")
+                return
             
-            # 对数据进行排序
-            sorted_indices = np.argsort(self.lifetime_calibration)
-            sorted_lifetime = np.array(self.lifetime_calibration)[sorted_indices]
-            sorted_temperature = np.array(self.temperature_calibration)[sorted_indices]
+            # 计算平均寿命
+            avg_lifetime = self.calculate_average_lifetime()
+            if avg_lifetime is None:
+                QMessageBox.warning(self, "警告", "无法计算平均寿命")
+                return
             
-            # 确定外推使用的两个边界点
-            if tau_to_interpolate <= sorted_lifetime[0]:
-                # 使用前两个点进行外推
-                x_use = sorted_lifetime[:2]
-                y_use = sorted_temperature[:2]
-                extrapolation_type = "最小值外推"
-            elif tau_to_interpolate >= sorted_lifetime[-1]:
-                # 使用最后两个点进行外推
-                x_use = sorted_lifetime[-2:]
-                y_use = sorted_temperature[-2:]
-                extrapolation_type = "最大值外推"
-            else:
-                # 在范围内，使用numpy插值
-                x_use = sorted_lifetime
-                y_use = sorted_temperature
-                extrapolation_type = "内插"
-            
-            # 计算线性拟合参数
-            if len(x_use) == 2:
-                # 两点线性外推/内插
-                slope = (y_use[1] - y_use[0]) / (x_use[1] - x_use[0])
-                self.temperature_measure = y_use[0] + slope * (tau_to_interpolate - x_use[0])
-            else:
-                # 使用numpy插值（范围内）
-                self.temperature_measure = np.interp(tau_to_interpolate, x_use, y_use)
+            # 使用线性插值和两侧外推计算温度（这会设置self.temperature）
+            temperature = self.calculate_temperature_by_interpolation(avg_lifetime)
+            if temperature is None:
+                QMessageBox.warning(self, "警告", "温度计算失败")
+                return
             
             # 显示结果
-            self.textEdit.setText(f'{self.temperature_measure:.2f} °C')
-            self.textEdit.setHtml(f'<div align="center"><font color="red" size="7">{self.temperature_measure:.2f} °C</font></div>')
+            self.display_temperature_result(temperature, avg_lifetime)
             
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"计算寿命温度时出错:{message}")
+            QMessageBox.critical(self, "错误", f"计算寿命温度时出错: {str(e)}")
             traceback.print_exc()
+
+    def calculate_average_lifetime(self):
+        """计算平均寿命 (a*t1^2 + c*t2^2) / (a*t1 + c*t2)"""
+        try:
+            model_type = self.comboBox.currentText()
+            
+            if model_type == '单指数':
+                # 单指数模型：寿命就是衰减常数
+                tau = self.result.params[1]  # b参数
+                print(f"单指数寿命: {tau:.5e} s")
+                return tau
+                
+            elif model_type == '双指数':
+                # 双指数模型：计算加权平均寿命
+                # 参数顺序: [a, t1, c, t2, e]
+                a = self.result.params[0]  # 快速分量振幅
+                t1 = self.result.params[1]  # 快速衰减时间常数
+                c = self.result.params[2]  # 慢速分量振幅
+                t2 = self.result.params[3]  # 慢速衰减时间常数
+                
+                # 计算平均寿命: (a*t1^2 + c*t2^2) / (a*t1 + c*t2)
+                numerator = a * (t1 ** 2) + c * (t2 ** 2)
+                denominator = a * t1 + c * t2
+                
+                if denominator == 0:
+                    print("警告：分母为零，无法计算平均寿命")
+                    return None
+                    
+                avg_lifetime = numerator / denominator
+                print(f"双指数平均寿命计算:")
+                print(f"  a = {a:.5e}, t1 = {t1:.5e} s")
+                print(f"  c = {c:.5e}, t2 = {t2:.5e} s")
+                print(f"  分子: {numerator:.5e}, 分母: {denominator:.5e}")
+                print(f"  平均寿命: {avg_lifetime:.5e} s")
+                return avg_lifetime
+                
+            else:
+                print(f"不支持的模型类型: {model_type}")
+                return None
+                
+        except Exception as e:
+            print(f"计算平均寿命时出错: {str(e)}")
+            traceback.print_exc()
+            return None
+
+    def calculate_temperature_by_interpolation(self, lifetime):
+        """使用线性插值和两侧外推计算温度，并保存到self.temperature"""
+        try:
+            # 确保标定数据是numpy数组（单位：秒s）
+            lifetimes = np.array(self.lifetime_calibration)
+            temperatures = np.array(self.temperature_calibration)
+            
+            # 对数据进行排序
+            sorted_indices = np.argsort(lifetimes)
+            sorted_lifetimes = lifetimes[sorted_indices]
+            sorted_temperatures = temperatures[sorted_indices]
+            
+            # 使用科学计数法显示（单位：秒）
+            print(f"标定数据 - 寿命范围: [{min(sorted_lifetimes):.5e}, {max(sorted_lifetimes):.5e}] s")
+            print(f"标定数据 - 温度范围: [{min(sorted_temperatures):.2f}, {max(sorted_temperatures):.2f}] °C")
+            print(f"当前寿命: {lifetime:.5e} s")
+            
+            # 检查寿命值是否在标定数据范围内
+            if lifetime <= sorted_lifetimes[0]:
+                # 左侧外推：使用前两个点
+                x0, x1 = sorted_lifetimes[0], sorted_lifetimes[1]
+                y0, y1 = sorted_temperatures[0], sorted_temperatures[1]
+                slope = (y1 - y0) / (x1 - x0)
+                temperature = y0 + slope * (lifetime - x0)
+                method = "左侧外推"
+                
+            elif lifetime >= sorted_lifetimes[-1]:
+                # 右侧外推：使用最后两个点
+                x0, x1 = sorted_lifetimes[-2], sorted_lifetimes[-1]
+                y0, y1 = sorted_temperatures[-2], sorted_temperatures[-1]
+                slope = (y1 - y0) / (x1 - x0)
+                temperature = y1 + slope * (lifetime - x1)
+                method = "右侧外推"
+                
+            else:
+                # 线性插值：在范围内
+                temperature = np.interp(lifetime, sorted_lifetimes, sorted_temperatures)
+                method = "线性插值"
+            
+            # 保存温度到self.temperature
+            self.temperature = temperature
+            
+            print(f"计算方法: {method}, 计算温度: {temperature:.2f} °C")
+            return temperature
+            
+        except Exception as e:
+            print(f"温度插值计算时出错: {str(e)}")
+            traceback.print_exc()
+            return None
+
+    def display_temperature_result(self, temperature, avg_lifetime):
+        """显示温度计算结果，保持现有textEdit格式"""
+        try:
+            model_type = self.comboBox.currentText()
+            
+            # 构建显示文本
+            result_text = f"""
+            <div align="center">
+                <font color="red" size="9">{temperature:.2f} ℃</font>
+            </div>
+            """
+            
+            self.textEdit.setHtml(result_text)
+            
+            # 同时在控制台输出详细信息
+            print(f"温度计算结果:")
+            print(f"  模型类型: {model_type}")
+            print(f"  平均寿命: {avg_lifetime:.6f}")
+            print(f"  计算温度: {temperature:.2f} °C")
+            print(f"  拟合优度 R²: {self.result.rsquare:.4f}")
+            
+        except Exception as e:
+            print(f"显示温度结果时出错: {str(e)}")
+            # 如果出错，至少显示温度值
+            self.textEdit.setHtml(f'<div align="center"><font color="red" size="9">{temperature:.2f} ℃</font></div>')
     
     def validate_folder_path(self, path):
         """验证文件夹路径是否有效"""
@@ -1822,12 +2220,20 @@ class mainWindow(QMainWindow, main_window):
 
     def closeEvent(self, event):
         """重写关闭事件"""
-        self.cleanup()
-        event.accept()
+        try:
+            self.cleanup()
+            event.accept()
+        except Exception as e:
+            print(f"关闭程序时出错: {str(e)}")
+            event.accept()
 
 if __name__ == '__main__':
-    QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
-    app = QApplication(sys.argv)
-    myWin = mainWindow()
-    myWin.show()
-    sys.exit(app.exec_())
+    try:
+        QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
+        app = QApplication(sys.argv)
+        myWin = mainWindow()
+        myWin.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"程序启动时出错: {str(e)}")
+        traceback.print_exc()
