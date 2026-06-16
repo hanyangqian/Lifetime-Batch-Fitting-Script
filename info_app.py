@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 from PyQt5.QtWidgets import (QMainWindow, QVBoxLayout, QTableWidgetItem, 
                             QMessageBox, QGraphicsScene, QApplication, 
                             QHeaderView, QFileDialog, QTreeWidgetItem)
@@ -6,7 +6,12 @@ from PyQt5 import QtWidgets, QtGui
 import PyQt5.QtCore as QtCore
 from PyQt5.QtCore import QTimer, QCoreApplication, pyqtSignal, QObject, QDir, QSettings
 from PyQt5.QtGui import QImage, QPixmap, QFont, QCursor
-from Ui_info_window import Ui_MainWindow as main_window
+from info_window import Ui_MainWindow as main_window
+import os
+
+for _thread_env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_thread_env, "1")
+
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FC
@@ -17,7 +22,6 @@ import numpy as np
 import zipfile
 import tempfile
 import pandas as pd
-import os
 from scipy.optimize import curve_fit
 from scipy.interpolate import make_interp_spline
 import copy
@@ -31,6 +35,9 @@ from scipy.stats import chi2
 import warnings
 from enum import Enum
 import inspect
+import concurrent.futures
+import multiprocessing
+import time
 
 # 常量定义
 DEFAULT_FIT_OPTIONS = {
@@ -43,6 +50,73 @@ DEFAULT_FIT_OPTIONS = {
 }
 
 UNIT_MAPPING = {'s': 1, 'ms': 1000, 'μs': 1000000, 'ns': 1000000000}
+DEFAULT_BATCH_WORKERS = min(2, os.cpu_count() or 1)
+DEFAULT_FIT_INTERNAL_UNIT = 'μs'
+FIT_INTERNAL_UNIT_TOOLTIP = (
+    "拟合内部使用的时间单位，只影响优化器数值尺度；结果仍按秒保存、按显示单位显示。\n"
+    "寿命约 0.001-1 μs：选 ns；约 1-10000 μs：选 μs（推荐你的衰减数据）；"
+    "约 1-10000 ms：选 ms；寿命接近秒级：选 s。\n"
+    "单位合适时，tau 数值通常落在 1-10000 附近，拟合更稳定。"
+)
+
+def _profile_log(label, seconds, context=None):
+    prefix = "[PROFILE]"
+    if context:
+        prefix += f"[{context}]"
+    print(f"{prefix} {label}: {seconds:.3f}s")
+
+def _tau_indices_for_model(model):
+    if model == '单指数':
+        return [1]
+    if model == '双指数':
+        return [1, 3]
+    return []
+
+def _scale_tau_values(values, model, scale):
+    if values is None:
+        return values
+    scaled = list(values)
+    for idx in _tau_indices_for_model(model):
+        if idx < len(scaled) and scaled[idx] is not None and np.isfinite(scaled[idx]):
+            scaled[idx] = float(scaled[idx]) * scale
+    return scaled
+
+def _unscale_tau_values(values, model, scale):
+    if values is None:
+        return values
+    scaled = np.asarray(values, dtype=float).copy()
+    for idx in _tau_indices_for_model(model):
+        if idx < len(scaled) and np.isfinite(scaled[idx]):
+            scaled[idx] = scaled[idx] / scale
+    return scaled
+
+def _model_predict(model, x, params):
+    model_def = MATLABCurveFitter()._get_model_definition(model)
+    if model_def is None:
+        return None
+    return model_def['function'](x, *params)
+
+def _convert_fit_result_to_seconds(result, model, scale, x_seconds, y):
+    if scale == 1 or result.params is None:
+        return result
+
+    result.params = _unscale_tau_values(result.params, model, scale)
+    y_pred = _model_predict(model, np.asarray(x_seconds, dtype=float), result.params)
+    if y_pred is not None:
+        residuals = np.asarray(y, dtype=float) - y_pred
+        sse, rsquare, dfe, adjrsquare, rmse = MATLABCurveFitter()._calculate_goodness_of_fit(
+            np.asarray(y, dtype=float),
+            y_pred,
+            residuals,
+            len(result.param_names or [])
+        )
+        result.sse = sse
+        result.rsquare = rsquare
+        result.dfe = dfe
+        result.adjrsquare = adjrsquare
+        result.rmse = rmse
+        result.residuals = residuals
+    return result
 
 class RobustMethod(Enum):
     OFF = 'Off'
@@ -127,6 +201,13 @@ class MATLABFitResult:
         
         for i, (name, value) in enumerate(zip(self.param_names, self.params)):
             output.append(f"     {name} = {value:.6f}")
+
+        if self.param_names == ['a', 't1', 'c', 't2', 'e'] and len(self.params) >= 4:
+            a, t1, c, t2 = self.params[:4]
+            denominator = a * t1 + c * t2
+            if denominator != 0:
+                avg_lifetime = (a * (t1 ** 2) + c * (t2 ** 2)) / denominator
+                output.append(f"     平均寿命 = {avg_lifetime:.6f}")
         
         output.append("")
         output.append("拟合优度统计:")
@@ -142,6 +223,8 @@ class MATLABCurveFitter:
     
     def __init__(self):
         self.options = MATLABCurveFitOptions()
+        self.cancel_requested = None
+        self.multi_start_enabled = True
     
     def set_options(self, **kwargs):
         """设置拟合选项，参数名与MATLAB一致"""
@@ -265,12 +348,17 @@ class MATLABCurveFitter:
         # 应用排除点
         x_fit, y_fit, include_mask = self._apply_exclude(x, y, self.options.Exclude)
         
+        # 记录当前模型类型，供内部优化逻辑使用
+        self.current_model_type = model_type
+
         # 执行拟合
         result = self._fit_implementation(x_fit, y_fit, func, initial_guess, param_names)
-        
-        # 计算完整数据的残差
-        y_pred_full = func(x, *result.params)
-        result.residuals = y - y_pred_full
+
+
+        # 计算完整数据的残差（仅在拟合成功时）
+        if result.params is not None:
+            y_pred_full = func(x, *result.params)
+            result.residuals = y - y_pred_full
         
         return result
     
@@ -302,63 +390,173 @@ class MATLABCurveFitter:
         return models.get(model_type)
 
     def _get_default_start_point(self, model_type, x, y):
-        """修改双指数模型的初始参数计算"""
+        """优化初始参数计算 - 更智能的初始值估计"""
         if model_type == '双指数':
             y_range = np.max(y) - np.min(y)
             if y_range == 0:
                 y_range = 1.0
-                
-            # 计算初始时间常数估计 (t1和t2)
-            # 方法1：使用数据的分位数估计衰减时间
-            decay_10_idx = np.argmin(np.abs(y - (np.max(y)*0.1)))
-            decay_50_idx = np.argmin(np.abs(y - (np.max(y)*0.5)))
+
+            # 使用数据起点的一段距离来估计I0（初始强度）
+            # 取前10%的数据点来估计初始值，避免噪声影响
+            start_fraction = 0.1  # 使用前10%的数据
+            n_start_points = max(5, int(len(x) * start_fraction))  # 至少5个点
             
-            # 确保有足够的点用于估计
-            if decay_50_idx < 1:
-                decay_50_idx = len(x) // 2
-            if decay_10_idx <= decay_50_idx:
-                decay_10_idx = decay_50_idx + len(x) // 4
+            if n_start_points < len(x):
+                x_start = x[:n_start_points]
+                y_start = y[:n_start_points]
                 
-            # 计算时间常数 (t1和t2)，确保 t1 < t2
-            t1_guess = x[decay_50_idx] / np.log(2)  # 快速衰减分量（半衰期估计）
-            t2_guess = x[decay_10_idx] / np.log(10)  # 慢速衰减分量（1/10衰减期估计）
-            
+                # 对于荧光衰减数据，基线I0应该是衰减结束后的稳定水平
+                # 使用末尾一段数据的平均值作为基线，避免噪声影响
+                end_section = max(10, len(y)//20)  # 至少10个点，或数据长度的5%，取较大者
+                baseline_est = np.mean(y[-end_section:])  # 基线取末尾一段的平均值
+                initial_intensity = np.max(y_start) - baseline_est
+                
+                # 确保初始强度为正值且合理
+                initial_intensity = max(initial_intensity, y_range * 0.1)
+                I0_estimate = baseline_est  # I0是基线参数
+            else:
+                # 如果数据点太少，使用传统方法
+                initial_intensity = y_range * 0.7
+                I0_estimate = np.min(y)
+
+            # 改进的时间常数估计方法
+            # 方法1：基于数据特征的衰减时间估计
+            y_normalized = (y - np.min(y)) / y_range
+
+            # 找到衰减到不同百分比的点
+            decay_levels = [0.9, 0.5, 0.1]  # 90%, 50%, 10% 衰减点
+            decay_times = []
+
+            for level in decay_levels:
+                # 找到最接近该衰减水平的点
+                idx = np.argmin(np.abs(y_normalized - level))
+                if idx < len(x) - 1:  # 确保不是最后一个点
+                    decay_times.append(x[idx])
+
+            # 如果找到的点不够，用默认值补充
+            while len(decay_times) < 3:
+                decay_times.append(x[len(x)//(len(decay_times)+1)])
+
+            # 排序确保时间顺序
+            decay_times.sort()
+
+            # 计算时间常数 - 使用更稳定的方法
+            # t1: 快速分量 (从90%到50%衰减的时间)
+            if len(decay_times) >= 2:
+                t1_guess = (decay_times[1] - decay_times[0]) / np.log(2)  # 半衰期
+            else:
+                t1_guess = x[len(x)//4] / 2
+
+            # t2: 慢速分量 (从50%到10%衰减的时间)
+            if len(decay_times) >= 3:
+                t2_guess = (decay_times[2] - decay_times[1]) / (np.log(10) - np.log(2))  # 从50%到10%的衰减时间
+            else:
+                t2_guess = x[len(x)//2] / 3
+
             # 确保 t1 < t2（快速分量衰减更快）
             if t1_guess >= t2_guess:
                 t1_guess, t2_guess = t2_guess, t1_guess
-                # 如果交换后仍然不满足，设置默认比例
+                # 如果仍然不满足，设置合理的比例
                 if t1_guess >= t2_guess:
-                    t1_guess = t2_guess / 5
-            
-            # 确保时间常数为正值
-            t1_guess = max(t1_guess, 1e-6)
-            t2_guess = max(t2_guess, t1_guess * 1.1)
-            
-            return [
-                y_range * 0.7,  # a (快速分量振幅)
-                t1_guess,       # t1 (快速衰减时间常数)
-                y_range * 0.3,  # c (慢速分量振幅)
-                t2_guess,       # t2 (慢速衰减时间常数)
-                np.min(y)       # e (基线)
-            ]
+                    t1_guess = t2_guess / 3
+
+            # 确保时间常数在合理范围内 - 使用更智能的边界
+            # 基于数据的时间范围和采样率来设置合理的边界
+            dt = np.mean(np.diff(x)) if len(x) > 1 else x[0]  # 平均时间间隔
+            min_tau = max(dt * 0.01, 1e-12)  # 最小时间常数至少是时间间隔的0.01倍，更小的下限
+            max_tau = x[-1] * 100  # 最大时间常数是数据总长的100倍，更大的上限
+
+            t1_guess = np.clip(t1_guess, min_tau, max_tau)
+            t2_guess = np.clip(t2_guess, t1_guess * 1.1, max_tau)
+
+            # 振幅分配 - 基于I0估计重新分配
+            # 快速分量通常占较大比例，但要确保总和不超过初始强度
+            # 使用更保守的比例来避免边界问题
+            a_guess = initial_intensity * 0.5  # 快速分量振幅 - 降低比例
+            c_guess = initial_intensity * 0.2  # 慢速分量振幅 - 降低比例
+            e_guess = I0_estimate               # 基线
+
+            # 确保振幅不为负
+            a_guess = max(a_guess, 0)
+            c_guess = max(c_guess, 0)
+
+            return [a_guess, t1_guess, c_guess, t2_guess, e_guess]
+
         elif model_type == '单指数':
-            # 单指数衰减模型的初始值计算
+            # 单指数衰减模型的初始值计算 - 多方法融合
             y_range = np.max(y) - np.min(y)
             if y_range == 0:
                 y_range = 1.0
-            
-            # 使用对数线性回归估计衰减率
+
+            # 方法1：改进的线性回归法
             y_adj = y - np.min(y) + 1e-10
-            valid_idx = y_adj > 0.1 * np.max(y_adj)
-            if np.sum(valid_idx) > 2:
+            valid_idx = y_adj > 0.05 * np.max(y_adj)  # 稍微严格的阈值
+
+            tau_candidates = []
+            amplitude_candidates = []
+
+            if np.sum(valid_idx) > 5:
+                # 使用加权线性回归
                 log_y = np.log(y_adj[valid_idx])
-                slope, _ = np.polyfit(x[valid_idx], log_y, 1)
-                tau = -1.0/slope if slope < 0 else -0.1
+                x_valid = x[valid_idx]
+
+                # 尝试不同的权重方案
+                weights = y_adj[valid_idx] / np.max(y_adj[valid_idx])
+                try:
+                    slope, intercept = np.polyfit(x_valid, log_y, 1, w=weights)
+                    if slope < -1e-10:  # 确保有足够的衰减
+                        tau_reg = -1.0 / slope
+                        amplitude_reg = np.exp(intercept)
+                        tau_candidates.append(tau_reg)
+                        amplitude_candidates.append(amplitude_reg)
+                except:
+                    pass
+
+            # 方法2：基于半衰期的估计
+            try:
+                y_half = (np.max(y) + np.min(y)) / 2
+                half_idx = np.where(y <= y_half)[0]
+                if len(half_idx) > 0:
+                    t_half = x[half_idx[0]]
+                    tau_half = t_half / np.log(2)  # τ = t_half / ln(2)
+                    if tau_half > 0:
+                        tau_candidates.append(tau_half)
+                        amplitude_candidates.append(y_range * 0.9)
+            except:
+                pass
+
+            # 方法3：基于数据范围的保守估计
+            tau_range = x[len(x)//4] / np.log(2)  # 在1/4处衰减一半
+            tau_candidates.append(tau_range)
+            amplitude_candidates.append(y_range * 0.8)
+
+            # 选择最合理的tau
+            dt = np.mean(np.diff(x)) if len(x) > 1 else x[0]
+            min_tau = max(dt * 0.01, 1e-12)
+            x_span = abs(x[-1] - x[0]) if len(x) > 1 else max(abs(x[0]), 1.0)
+            max_tau = x_span * 100  # 放宽上限，避免慢衰减单指数卡在边界
+
+            # 过滤合理的tau值
+            valid_tau = [t for t in tau_candidates if min_tau <= t <= max_tau]
+            if valid_tau:
+                tau = np.median(valid_tau)  # 使用中位数提高稳健性
             else:
-                tau = -0.1
-                
-            return [y_range, 1.0/tau, np.min(y)]
-        
+                tau = x[len(x)//3] / np.log(2)
+
+            # 选择对应的amplitude
+            if valid_tau:
+                tau_idx = tau_candidates.index(tau) if tau in tau_candidates else 0
+                amplitude = amplitude_candidates[min(tau_idx, len(amplitude_candidates)-1)]
+            else:
+                amplitude = y_range * 0.7
+
+            # 最终约束
+            tau = np.clip(tau, min_tau, max_tau)
+            amplitude = np.clip(amplitude, y_range * 0.05, y_range * 3)
+            baseline = np.min(y)
+
+            return [amplitude, tau, baseline]
+
         # 其他模型的默认初始值
         return [1.0] * len(self._get_model_definition(model_type)['param_names'])
         
@@ -367,56 +565,150 @@ class MATLABCurveFitter:
         """改进的拟合实现核心"""
         result = MATLABFitResult()
         result.param_names = param_names
-        
-        # 设置优化选项
-        lsq_options = {
-            'method': 'trf' if self.options.Algorithm == Algorithm.TRUST_REGION else 'lm',
-            'max_nfev': self.options.MaxFunEvals,
-            'ftol': self.options.TolFun,
-            'xtol': self.options.TolX,
-            'gtol': self.options.TolX,
-            'x_scale': 'jac',
-            'verbose': 2,  # 输出详细优化信息
-            'tr_solver': 'lsmr',  # 使用更稳定的求解器
-            'loss': 'soft_l1' if self.options.Robust != RobustMethod.OFF else 'linear',
-        }
-        
+
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        initial_guess = np.asarray(initial_guess, dtype=float)
+        x_original = x.copy()
+
+        # 对指数模型进行x平移，提升数值稳定性
+        single_exp_model = (
+            len(param_names) == 3
+            and hasattr(self, 'current_model_type')
+            and self.current_model_type == '单指数'
+        )
+        double_exp_model = (
+            len(param_names) == 5
+            and hasattr(self, 'current_model_type')
+            and self.current_model_type == '双指数'
+        )
+        exp_model = single_exp_model or double_exp_model
+        x_offset = float(np.min(x)) if (exp_model and len(x) > 0) else 0.0
+        if exp_model:
+            x = x - x_offset
+
+        requested_method = 'trf' if self.options.Algorithm == Algorithm.TRUST_REGION else 'lm'
+        needs_robust = self.options.Robust != RobustMethod.OFF
+        use_bounds = requested_method == 'trf' or needs_robust
+
+        # 初始化边界约束。LM 不支持边界；只有 Trust-Region/稳健拟合使用边界。
+        bounds_lower = np.full_like(initial_guess, -np.inf, dtype=float)
+        bounds_upper = np.full_like(initial_guess, np.inf, dtype=float)
+
+        if use_bounds:
+            # 应用用户设置的约束
+            if self.options.Lower is not None:
+                bounds_lower = np.maximum(bounds_lower, self.options.Lower)
+            if self.options.Upper is not None:
+                bounds_upper = np.minimum(bounds_upper, self.options.Upper)
+
         # 设置参数边界 (特别是对指数衰减模型)
-        if 'exp' in func.__code__.co_name.lower():  # 如果是指数模型
-            bounds_lower = np.full_like(initial_guess, -np.inf)
-            bounds_upper = np.full_like(initial_guess, np.inf)
-            
+        is_exp_model = any(name in ['b', 'tau', 't1', 't2', 'd'] for name in param_names)
+        if use_bounds and is_exp_model:
             # 对衰减率参数设置合理边界
             for i, name in enumerate(param_names):
                 if name in ['t1', 't2', 'b', 'd']:  # 衰减率参数
-                    bounds_lower[i] = 1e-6  # 最小衰减时间常数
-                    bounds_upper[i] = 1000  # 最大衰减时间常数
+                    x_span = abs(x[-1] - x[0]) if len(x) > 1 else max(abs(x[0]), 1.0)
+                    dt = abs(np.mean(np.diff(x))) if len(x) > 1 else max(abs(x[0]), 1e-9)
+                    min_tau = max(dt * 0.01, x_span * 1e-4, 1e-12)
+                    max_tau = max(x_span * 10, min_tau * 10)
+                    bounds_lower[i] = max(bounds_lower[i], min_tau)
+                    bounds_upper[i] = min(bounds_upper[i], max_tau)
                 elif name in ['a', 'c']:  # 振幅参数
-                    bounds_lower[i] = 0  # 振幅必须非负
-            
+                    bounds_lower[i] = max(bounds_lower[i], 0)  # 振幅必须非负
+
+            if double_exp_model:
+                y_range = np.max(y) - np.min(y)
+                if y_range <= 0:
+                    y_range = max(abs(np.max(y)), 1.0)
+                for name in ['a', 'c']:
+                    if name in param_names:
+                        idx = param_names.index(name)
+                        bounds_upper[idx] = min(bounds_upper[idx], y_range * 10)
+                if 'e' in param_names:
+                    baseline_idx = param_names.index('e')
+                    bounds_lower[baseline_idx] = max(bounds_lower[baseline_idx], np.min(y) - y_range)
+                    bounds_upper[baseline_idx] = min(bounds_upper[baseline_idx], np.max(y) + y_range)
+
+            # 特殊处理单指数模型
+            if len(param_names) == 3 and param_names[1] in ['b', 'tau']:  # 单指数模型
+                tau_idx = 1
+                amp_idx = 0
+                baseline_idx = 2
+
+                # 单指数的tau边界更严格
+                dt = np.mean(np.diff(x)) if len(x) > 1 else x[0] if len(x) > 0 else 1e-9
+                bounds_lower[tau_idx] = max(bounds_lower[tau_idx], dt * 0.01)  # 最小tau
+                x_span = abs(x[-1] - x[0]) if len(x) > 1 else max(abs(x[0]), 1.0)
+                bounds_upper[tau_idx] = min(bounds_upper[tau_idx], x_span * 100)  # 最大tau
+
+                # 振幅边界基于数据范围
+                y_range = np.max(y) - np.min(y)
+                if y_range <= 0:
+                    y_range = max(abs(np.max(y)), 1.0)
+                bounds_lower[amp_idx] = max(bounds_lower[amp_idx], y_range * 0.01)
+                bounds_upper[amp_idx] = min(bounds_upper[amp_idx], y_range * 5)
+
+                # 基线边界
+                bounds_lower[baseline_idx] = max(bounds_lower[baseline_idx], np.min(y) - y_range * 0.1)
+                bounds_upper[baseline_idx] = min(bounds_upper[baseline_idx], np.max(y))
+
             # 如果是双指数模型，添加 t1 < t2 的约束
             if len(param_names) >= 5 and 't1' in param_names and 't2' in param_names:
                 t1_idx = param_names.index('t1')
                 t2_idx = param_names.index('t2')
                 # 确保 t1 < t2 的边界约束
-                bounds_upper[t1_idx] = bounds_upper[t2_idx]  # t1 的上限不超过 t2 的上限
-            
+                bounds_upper[t1_idx] = min(bounds_upper[t1_idx], bounds_upper[t2_idx])  # t1 的上限不超过 t2 的上限
+
+        if use_bounds:
+            # 修正非法边界并将初值投影到边界内部
+            invalid_bounds = bounds_lower >= bounds_upper
+            if np.any(invalid_bounds):
+                eps = 1e-12
+                bounds_upper[invalid_bounds] = bounds_lower[invalid_bounds] + eps
+            initial_guess = np.clip(initial_guess, bounds_lower + 1e-14, bounds_upper - 1e-14)
+
+        # 设置优化选项
+        method = requested_method
+        if method == 'lm' and needs_robust:
+            method = 'trf'
+            use_bounds = True
+
+        lsq_options = {
+            'method': method,
+            'max_nfev': self.options.MaxFunEvals,
+            'ftol': self.options.TolFun,
+            'xtol': self.options.TolX,
+            'gtol': self.options.TolX,
+            'x_scale': 'jac',
+            'verbose': 0,
+        }
+
+        if method != 'lm':
             lsq_options['bounds'] = (bounds_lower, bounds_upper)
+            # 参数维度很小(3/5)，exact 通常比 lsmr 更快且稳定
+            lsq_options['tr_solver'] = 'exact'
+            lsq_options['loss'] = 'soft_l1' if needs_robust else 'linear'
         
         try:
             # 定义目标函数
             def objective(params):
-                # 如果是双指数模型，强制 t1 < t2
-                if len(params) >= 5 and hasattr(self, 'current_model_type') and self.current_model_type == '双指数':
-                    t1_idx = 1  # t1 在参数列表中的位置
-                    t2_idx = 3  # t2 在参数列表中的位置
-                    if params[t1_idx] >= params[t2_idx]:
-                        # 如果 t1 >= t2，返回很大的残差来惩罚这种配置
-                        return np.full_like(y, 1e10)
-                
-                y_pred = func(x, *params)
+                if callable(self.cancel_requested) and self.cancel_requested():
+                    raise InterruptedError("用户取消拟合")
+
+                fit_params = params
+                # 双指数采用平滑重排，避免 t1<t2 硬惩罚导致的非光滑目标
+                if double_exp_model and len(params) == 5:
+                    a0, t1_0, c0, t2_0, e0 = params
+                    if t1_0 > t2_0:
+                        fit_params = np.array([c0, t2_0, a0, t1_0, e0], dtype=float)
+
+                y_pred = func(x, *fit_params)
+                if not np.all(np.isfinite(y_pred)):
+                    return np.full_like(y, 1e10, dtype=float)
                 residuals = y - y_pred
-                
+                residuals = np.where(np.isfinite(residuals), residuals, 1e10)
+
                 # 应用稳健权重
                 if self.options.Robust != RobustMethod.OFF:
                     weights = self._robust_weight_function(residuals, self.options.Robust)
@@ -427,26 +719,317 @@ class MATLABCurveFitter:
                     residuals = residuals * np.sqrt(self.options.Weights)
                 
                 return residuals
+
+            def jacobian(params):
+                if single_exp_model and len(params) == 3:
+                    a, tau, _ = params
+                    tau = np.clip(tau, 1e-300, np.inf)
+                    exp_term = np.exp(np.clip(-x / tau, -700, 700))
+                    jac = np.column_stack((
+                        -exp_term,
+                        -(a * exp_term * x / (tau ** 2)),
+                        -np.ones_like(x)
+                    ))
+                elif double_exp_model and len(params) == 5:
+                    a, t1, c, t2, _ = params
+                    swapped = t1 > t2
+                    if swapped:
+                        a, t1, c, t2 = c, t2, a, t1
+
+                    t1 = np.clip(t1, 1e-300, np.inf)
+                    t2 = np.clip(t2, 1e-300, np.inf)
+                    exp1 = np.exp(np.clip(-x / t1, -700, 700))
+                    exp2 = np.exp(np.clip(-x / t2, -700, 700))
+                    ordered_jac = np.column_stack((
+                        -exp1,
+                        -(a * exp1 * x / (t1 ** 2)),
+                        -exp2,
+                        -(c * exp2 * x / (t2 ** 2)),
+                        -np.ones_like(x)
+                    ))
+                    jac = ordered_jac[:, [2, 3, 0, 1, 4]] if swapped else ordered_jac
+                else:
+                    raise ValueError("解析雅可比仅支持指数模型")
+
+                if self.options.Weights is not None:
+                    jac = jac * np.sqrt(self.options.Weights)[:, None]
+                return jac
+
+            if exp_model and self.options.Robust == RobustMethod.OFF:
+                lsq_options['jac'] = jacobian
             
             # 执行拟合 - 分阶段优化策略
             print(f"初始参数: {initial_guess}")
-            
-            # 第一阶段: 宽松容差快速拟合
+            profile_context = getattr(self, 'profile_context', None)
+            if profile_context:
+                _profile_log(f"fit.points={len(x)} params={len(initial_guess)} multistart={self.multi_start_enabled}", 0.0, profile_context)
+                _profile_log(f"fit.method={method} use_bounds={use_bounds}", 0.0, profile_context)
+
+            # 第一阶段: 使用较宽容容差快速收敛
             phase1_options = lsq_options.copy()
-            phase1_options['ftol'] = 1e-6
-            phase1_options['xtol'] = 1e-6
-            phase1_options['max_nfev'] = min(200, self.options.MaxFunEvals//2)
+            phase1_options['ftol'] = max(self.options.TolFun, 1e-6)
+            phase1_options['xtol'] = max(self.options.TolX, 1e-6)
+            phase1_options['gtol'] = max(self.options.TolX, 1e-6)
+            phase1_trial_options = phase1_options.copy()
+            # 多起点试探阶段：降低单次预算以提速，最终仍由第二阶段精修
+            phase1_trial_options['max_nfev'] = max(60, min(120, max(80, self.options.MaxFunEvals // 6)))
             
-            phase1_result = least_squares(objective, initial_guess, **phase1_options)
+            # 单指数：采用与双指数一致的多起点 + 局部精修流程
+            if (
+                self.multi_start_enabled
+                and len(initial_guess) == 3
+                and hasattr(self, 'current_model_type')
+                and self.current_model_type == '单指数'
+            ):
+                y_range = np.max(y) - np.min(y)
+                if y_range <= 0:
+                    y_range = max(abs(np.max(y)), 1.0)
+                x_range = abs(x[-1] - x[0]) if len(x) > 1 else max(abs(x[0]), 1.0)
+                dt = abs(np.mean(np.diff(x))) if len(x) > 1 else max(abs(x[0]), 1e-9)
+                tau_floor = max(dt * 0.01, 1e-12)
+                tau_cap = max(x_range * 100, tau_floor * 10)
+
+                a0, tau0, c0 = initial_guess
+                tau0 = np.clip(max(tau0, tau_floor), tau_floor, tau_cap)
+                a0 = np.clip(max(a0, y_range * 0.01), y_range * 0.01, y_range * 5)
+
+                initial_guesses = [np.array([a0, tau0, c0], dtype=float)]
+                perturbations = [
+                    (0.85, 0.75, 1.00),
+                    (1.15, 1.35, 1.00),
+                    (1.00, 0.55, 0.95),
+                    (1.00, 1.80, 1.05),
+                ]
+                for amp_scale, tau_scale, baseline_scale in perturbations:
+                    guess = np.array([a0 * amp_scale, tau0 * tau_scale, c0 * baseline_scale], dtype=float)
+                    if use_bounds:
+                        guess = np.clip(guess, bounds_lower + 1e-14, bounds_upper - 1e-14)
+                    initial_guesses.append(guess)
+
+                # 用一个对数线性候选替换最弱扰动，增强单指数全局性
+                tail_n = max(8, len(y) // 10)
+                y_tail = y[-tail_n:] if len(y) >= tail_n else y
+                y_baseline_ref = np.quantile(y_tail, 0.5)
+                y_adj = y - y_baseline_ref
+                valid = y_adj > max(np.max(y_adj) * 0.05, 1e-12)
+                if np.sum(valid) > 5:
+                    try:
+                        slope, intercept = np.polyfit(x[valid], np.log(y_adj[valid]), 1)
+                        if slope < -1e-12:
+                            tau_log = np.clip(-1.0 / slope, tau_floor, tau_cap)
+                            amp_log = np.clip(np.exp(intercept), y_range * 0.01, y_range * 5)
+                            guess = np.array([amp_log, tau_log, y_baseline_ref], dtype=float)
+                            if use_bounds:
+                                guess = np.clip(guess, bounds_lower + 1e-14, bounds_upper - 1e-14)
+                            initial_guesses.append(guess)
+                    except Exception:
+                        pass
+
+                # 去重并限制数量，控制耗时
+                uniq = []
+                seen = set()
+                for g in initial_guesses:
+                    key = tuple(np.round(g, 10))
+                    if key not in seen:
+                        seen.add(key)
+                        uniq.append(g)
+                initial_guesses = uniq[:5]
+
+                best_result = None
+                best_cost = np.inf
+
+                if profile_context:
+                    _profile_log(f"fit.multistart_single.count={len(initial_guesses)}", 0.0, profile_context)
+
+                for guess_idx, guess in enumerate(initial_guesses, start=1):
+                    try:
+                        t_guess = time.perf_counter()
+                        phase1_result = least_squares(objective, guess, **phase1_trial_options)
+                        if profile_context:
+                            _profile_log(
+                                f"fit.multistart_single[{guess_idx}/{len(initial_guesses)}] nfev={phase1_result.nfev} sse={2 * phase1_result.cost:.6g}",
+                                time.perf_counter() - t_guess,
+                                profile_context
+                            )
+                        if phase1_result.success and phase1_result.cost < best_cost:
+                            best_result = phase1_result
+                            best_cost = phase1_result.cost
+                    except:
+                        continue
+
+                if best_result is not None:
+                    # 对最佳候选再做一轮完整第一阶段精修
+                    t_phase1 = time.perf_counter()
+                    phase1_result = least_squares(objective, best_result.x, **phase1_options)
+                    if profile_context:
+                        _profile_log(
+                            f"fit.phase1_refine_single nfev={phase1_result.nfev} sse={2 * phase1_result.cost:.6g}",
+                            time.perf_counter() - t_phase1,
+                            profile_context
+                        )
+                else:
+                    t_phase1 = time.perf_counter()
+                    phase1_result = least_squares(objective, initial_guess, **phase1_options)
+                    if profile_context:
+                        _profile_log(
+                            f"fit.phase1_single_fallback nfev={phase1_result.nfev} sse={2 * phase1_result.cost:.6g}",
+                            time.perf_counter() - t_phase1,
+                            profile_context
+                        )
+            elif self.multi_start_enabled and double_exp_model:
+                # 双指数也使用多起点，降低局部最优风险
+                y_range = np.max(y) - np.min(y)
+                if y_range <= 0:
+                    y_range = max(abs(np.max(y)), 1.0)
+                x_range = abs(x[-1] - x[0]) if len(x) > 1 else max(abs(x[0]), 1.0)
+                dt = abs(np.mean(np.diff(x))) if len(x) > 1 else max(abs(x[0]), 1e-9)
+
+                tau_floor = max(dt * 0.01, 1e-12)
+                tau_cap = max(x_range * 100, tau_floor * 10)
+
+                a0, t10, c0, t20, e0 = initial_guess
+                t10 = np.clip(max(t10, tau_floor), tau_floor, tau_cap)
+                t20 = np.clip(max(t20, t10 * 1.1), tau_floor, tau_cap)
+
+                initial_guesses = [initial_guess.copy()]
+                perturbations = [
+                    (1.15, 0.70, 0.90, 1.30, 1.00),
+                    (0.85, 1.35, 1.10, 0.80, 1.00),
+                    (1.25, 0.55, 0.80, 1.60, 0.98),
+                    (0.75, 1.80, 1.20, 0.65, 1.02),
+                ]
+                for a_scale, t1_scale, c_scale, t2_scale, e_scale in perturbations:
+                    t1g = np.clip(t10 * t1_scale, tau_floor, tau_cap)
+                    t2g = np.clip(t20 * t2_scale, tau_floor, tau_cap)
+                    if t1g > t2g:
+                        t1g, t2g = t2g, t1g
+                    t2g = max(t2g, t1g * 1.1)
+                    t2g = min(t2g, tau_cap)
+                    guess = np.array([a0 * a_scale, t1g, c0 * c_scale, t2g, e0 * e_scale], dtype=float)
+                    if use_bounds:
+                        guess = np.clip(guess, bounds_lower + 1e-14, bounds_upper - 1e-14)
+                    initial_guesses.append(guess)
+
+                # 去重并限制数量，避免时间过长
+                uniq = []
+                seen = set()
+                for g in initial_guesses:
+                    key = tuple(np.round(g, 10))
+                    if key not in seen:
+                        seen.add(key)
+                        uniq.append(g)
+                # 保留智能初值和少量扰动候选，控制耗时
+                initial_guesses = uniq[:5]
+
+                best_result = None
+                best_cost = np.inf
+                if profile_context:
+                    _profile_log(f"fit.multistart_double.count={len(initial_guesses)}", 0.0, profile_context)
+
+                for guess_idx, guess in enumerate(initial_guesses, start=1):
+                    try:
+                        t_guess = time.perf_counter()
+                        phase1_result = least_squares(objective, guess, **phase1_trial_options)
+                        if profile_context:
+                            _profile_log(
+                                f"fit.multistart_double[{guess_idx}/{len(initial_guesses)}] nfev={phase1_result.nfev} sse={2 * phase1_result.cost:.6g}",
+                                time.perf_counter() - t_guess,
+                                profile_context
+                            )
+                        if phase1_result.success and phase1_result.cost < best_cost:
+                            best_result = phase1_result
+                            best_cost = phase1_result.cost
+                    except:
+                        continue
+
+                if best_result is not None:
+                    phase1_result = best_result
+                else:
+                    phase1_result = least_squares(objective, initial_guess, **phase1_options)
+            else:
+                # 非单指数模型使用标准方法
+                phase1_result = least_squares(objective, initial_guess, **phase1_options)
+
             print(f"第一阶段结果: {phase1_result.x}")
             
             # 第二阶段: 严格容差精细拟合
             phase2_options = lsq_options.copy()
+            if double_exp_model:
+                # 保留精修但避免过高上限导致耗时过长
+                phase2_options['max_nfev'] = max(self.options.MaxFunEvals, 1200)
+            t_phase2 = time.perf_counter()
             phase2_result = least_squares(objective, phase1_result.x, **phase2_options)
+            if profile_context:
+                _profile_log(
+                    f"fit.phase2 nfev={phase2_result.nfev} sse={2 * phase2_result.cost:.6g}",
+                    time.perf_counter() - t_phase2,
+                    profile_context
+                )
             print(f"第二阶段结果: {phase2_result.x}")
+
+            # 单指数兜底：若新策略失败，回退到更保守的单起点方案
+            if single_exp_model:
+                bad_result = (
+                    (not phase2_result.success) or
+                    (not np.all(np.isfinite(phase2_result.x)))
+                )
+                if bad_result:
+                    print("单指数新策略未收敛，回退到保守拟合流程...")
+
+                    y_abs = np.abs(y)
+                    legacy_floor = max(np.percentile(y_abs, 5) * 1e-3, 1e-12)
+
+                    def objective_legacy(params):
+                        if callable(self.cancel_requested) and self.cancel_requested():
+                            raise InterruptedError("用户取消拟合")
+                        y_pred = func(x, *params)
+                        if not np.all(np.isfinite(y_pred)):
+                            return np.full_like(y, 1e10, dtype=float)
+                        residuals = y - y_pred
+                        residuals = np.where(np.isfinite(residuals), residuals, 1e10)
+                        scale = np.sqrt(np.maximum(np.abs(y_pred), legacy_floor))
+                        residuals = residuals / scale
+                        if self.options.Robust != RobustMethod.OFF:
+                            weights = self._robust_weight_function(residuals, self.options.Robust)
+                            residuals = residuals * np.sqrt(weights)
+                        if self.options.Weights is not None:
+                            residuals = residuals * np.sqrt(self.options.Weights)
+                        return residuals
+
+                    legacy_phase1_options = phase1_options.copy()
+                    legacy_phase1_options.pop('jac', None)
+                    legacy_phase1 = least_squares(objective_legacy, initial_guess, **legacy_phase1_options)
+                    legacy_phase2_options = phase2_options.copy()
+                    legacy_phase2_options.pop('jac', None)
+                    legacy_phase2_options['max_nfev'] = max(self.options.MaxFunEvals, 800)
+                    legacy_phase2 = least_squares(objective_legacy, legacy_phase1.x, **legacy_phase2_options)
+
+                    if legacy_phase2.success and np.all(np.isfinite(legacy_phase2.x)):
+                        print("单指数回退流程收敛成功")
+                        phase2_result = legacy_phase2
+                    else:
+                        print("单指数回退流程仍未收敛")
             
             # 保存最终结果
-            result.params = phase2_result.x
+            fitted_params = phase2_result.x.copy()
+            if single_exp_model:
+                # 把平移坐标系下的振幅转换回原始x坐标系
+                a_fit, tau_fit, c_fit = fitted_params
+                if np.isfinite(tau_fit) and tau_fit != 0:
+                    exp_arg = np.clip(x_offset / tau_fit, -700, 700)
+                    a_fit = a_fit * np.exp(exp_arg)
+                fitted_params = np.array([a_fit, tau_fit, c_fit], dtype=float)
+            elif double_exp_model and len(fitted_params) == 5:
+                a_fit, t1_fit, c_fit, t2_fit, e_fit = fitted_params
+                if np.isfinite(t1_fit) and t1_fit != 0:
+                    a_fit = a_fit * np.exp(np.clip(x_offset / t1_fit, -700, 700))
+                if np.isfinite(t2_fit) and t2_fit != 0:
+                    c_fit = c_fit * np.exp(np.clip(x_offset / t2_fit, -700, 700))
+                if t1_fit > t2_fit:
+                    fitted_params = np.array([c_fit, t2_fit, a_fit, t1_fit, e_fit], dtype=float)
+                else:
+                    fitted_params = np.array([a_fit, t1_fit, c_fit, t2_fit, e_fit], dtype=float)
+            result.params = fitted_params
             result.success = phase2_result.success
             result.message = phase2_result.message
             result.iterations = phase2_result.nfev
@@ -454,7 +1037,7 @@ class MATLABCurveFitter:
             result.jacobian = phase2_result.jac
             
             # 计算拟合优度统计量
-            y_pred = func(x, *result.params)
+            y_pred = func(x_original, *result.params)
             residuals = y - y_pred
             
             sse, rsquare, dfe, adjrsquare, rmse = self._calculate_goodness_of_fit(
@@ -467,19 +1050,617 @@ class MATLABCurveFitter:
             result.rmse = rmse
             result.residuals = residuals
             
+        except InterruptedError as e:
+            result.success = False
+            result.message = str(e)
+            result.params = initial_guess
+            return result
         except Exception as e:
             result.success = False
             result.message = f"拟合失败: {str(e)}"
+            # 设置初始参数作为回退值
+            result.params = initial_guess
             print(f"拟合错误: {str(e)}")
             print(traceback.format_exc())
         
         return result
 
+def run_fit_task(task, cancel_check=None):
+    """在后台线程执行拟合计算（不访问UI对象）。"""
+    profile_context = os.path.basename(task.get('file_path', 'fit_task'))
+    profile_start = time.perf_counter()
+
+    def configure_fitter(fitter_obj, fit_task):
+        robust_mapping = {
+            'Off': RobustMethod.OFF,
+            'LAR': RobustMethod.LAR,
+            'Bisquare': RobustMethod.BISQUARE
+        }
+        algorithm_mapping = {
+            'Levenberg-Marquardt': Algorithm.LEVENBERG_MARQUARDT,
+            'Trust-Region': Algorithm.TRUST_REGION,
+        }
+
+        robust_method = robust_mapping.get(fit_task.get('robust_text'), RobustMethod.OFF)
+        algorithm_method = algorithm_mapping.get(
+            fit_task.get('algorithm_text'),
+            Algorithm.LEVENBERG_MARQUARDT
+        )
+
+        fit_options = fit_task.get('fit_options', {})
+        fitter_obj.set_options(
+            Robust=robust_method,
+            Algorithm=algorithm_method,
+            **fit_options
+        )
+
+        start = fit_task.get('start', [])
+        lower = fit_task.get('lower', [])
+        upper = fit_task.get('upper', [])
+
+        if any(v is not None for v in start):
+            fitter_obj.options.StartPoint = start
+
+        if any(v is not None for v in lower):
+            fitter_obj.options.Lower = np.array(
+                [-np.inf if v is None else v for v in lower],
+                dtype=float
+            )
+
+        if any(v is not None for v in upper):
+            fitter_obj.options.Upper = np.array(
+                [np.inf if v is None else v for v in upper],
+                dtype=float
+            )
+
+        fitter_obj.multi_start_enabled = fit_task.get('multi_start_enabled', True)
+
+    def extract_characteristic_tau(model, params):
+        try:
+            if model == '单指数' and len(params) >= 2:
+                tau = float(params[1])
+                return tau if np.isfinite(tau) and tau > 0 else None
+            if model == '双指数' and len(params) >= 4:
+                taus = [float(params[1]), float(params[3])]
+                valid_taus = [tau for tau in taus if np.isfinite(tau) and tau > 0]
+                return max(valid_taus) if valid_taus else None
+        except Exception:
+            return None
+        return None
+
+    def refine_task_by_tau_window(fit_task, fit_result):
+        tau_multiple = fit_task.get('fit_window_tau_multiple')
+        if tau_multiple is None or tau_multiple <= 0 or not fit_result.success:
+            return None, None
+
+        tau = extract_characteristic_tau(fit_task['model'], fit_result.params)
+        if tau is None:
+            return None, None
+
+        x_fit = np.asarray(fit_task['x_for_fitting'], dtype=float)
+        y_fit = np.asarray(fit_task['y_for_fitting'], dtype=float)
+        if len(x_fit) < 3:
+            return None, None
+
+        x_start = float(np.min(x_fit))
+        x_limit = x_start + tau_multiple * tau
+        mask = x_fit <= (x_limit + max(1e-15, abs(x_limit) * 1e-12))
+        min_points = max(len(fit_result.params) + 1, 3)
+
+        if np.count_nonzero(mask) < min_points or np.all(mask):
+            return None, None
+
+        refined_task = dict(fit_task)
+        refined_task['x_for_fitting'] = x_fit[mask]
+        refined_task['y_for_fitting'] = y_fit[mask]
+        refined_task['start'] = [float(v) for v in np.asarray(fit_result.params, dtype=float)]
+        refined_task['multi_start_enabled'] = False
+
+        return refined_task, {
+            'tau_multiple': float(tau_multiple),
+            'tau': float(tau),
+            'x_limit': float(x_limit),
+            'points_used': int(np.count_nonzero(mask)),
+            'points_total': int(len(x_fit)),
+            '_mask': mask
+        }
+
+    def score_result_on_task(fit_task, fit_result):
+        if fit_result.params is None:
+            return np.inf
+
+        model_def = MATLABCurveFitter()._get_model_definition(fit_task['model'])
+        if model_def is None:
+            return np.inf
+
+        x_fit = np.asarray(fit_task['x_for_fitting'], dtype=float)
+        y_fit = np.asarray(fit_task['y_for_fitting'], dtype=float)
+        try:
+            y_pred = model_def['function'](x_fit, *fit_result.params)
+            residuals = y_fit - y_pred
+            if not np.all(np.isfinite(residuals)):
+                return np.inf
+            return float(np.sum(residuals ** 2))
+        except Exception:
+            return np.inf
+
+    fit_unit = task.get('fit_internal_unit', DEFAULT_FIT_INTERNAL_UNIT)
+    fit_scale = UNIT_MAPPING.get(fit_unit, 1)
+    optimizer_task = dict(task)
+    optimizer_task['x_for_fitting'] = np.asarray(task['x_for_fitting'], dtype=float) * fit_scale
+    optimizer_task['start'] = _scale_tau_values(task.get('start', []), task['model'], fit_scale)
+    optimizer_task['lower'] = _scale_tau_values(task.get('lower', []), task['model'], fit_scale)
+    optimizer_task['upper'] = _scale_tau_values(task.get('upper', []), task['model'], fit_scale)
+    _profile_log(f"fit.internal_unit={fit_unit} scale={fit_scale}", 0.0, profile_context)
+
+    fitter = MATLABCurveFitter()
+    fitter.cancel_requested = cancel_check
+    fitter.profile_context = profile_context
+    configure_fitter(fitter, optimizer_task)
+
+    _profile_log(f"fit.initial_points={len(optimizer_task['x_for_fitting'])}", 0.0, profile_context)
+    t0 = time.perf_counter()
+    result = fitter.fit_curve(
+        optimizer_task['x_for_fitting'],
+        optimizer_task['y_for_fitting'],
+        optimizer_task['model']
+    )
+    _profile_log("fit.initial_full_range", time.perf_counter() - t0, profile_context)
+
+    x_for_fitting = task['x_for_fitting']
+    y_for_fitting = task['y_for_fitting']
+    fit_window_meta = None
+
+    refined_task, fit_window_meta = refine_task_by_tau_window(optimizer_task, result)
+    if refined_task is not None:
+        baseline_window_sse = score_result_on_task(refined_task, result)
+        refined_fitter = MATLABCurveFitter()
+        refined_fitter.cancel_requested = cancel_check
+        refined_fitter.profile_context = profile_context
+        configure_fitter(refined_fitter, refined_task)
+
+        _profile_log(f"fit.refined_points={len(refined_task['x_for_fitting'])}", 0.0, profile_context)
+        t0 = time.perf_counter()
+        refined_result = refined_fitter.fit_curve(
+            refined_task['x_for_fitting'],
+            refined_task['y_for_fitting'],
+            refined_task['model']
+        )
+        _profile_log("fit.tau_window_refine", time.perf_counter() - t0, profile_context)
+
+        refined_window_sse = score_result_on_task(refined_task, refined_result)
+        refined_is_acceptable = (
+            refined_result.success
+            and np.isfinite(refined_window_sse)
+            and refined_window_sse <= baseline_window_sse * (1.0 + 1e-8)
+        )
+
+        if not refined_is_acceptable:
+            fallback_task = dict(refined_task)
+            fallback_task['multi_start_enabled'] = True
+            fallback_fitter = MATLABCurveFitter()
+            fallback_fitter.cancel_requested = cancel_check
+            fallback_fitter.profile_context = profile_context
+            configure_fitter(fallback_fitter, fallback_task)
+            _profile_log(f"fit.fallback_points={len(fallback_task['x_for_fitting'])}", 0.0, profile_context)
+            t0 = time.perf_counter()
+            fallback_result = fallback_fitter.fit_curve(
+                fallback_task['x_for_fitting'],
+                fallback_task['y_for_fitting'],
+                fallback_task['model']
+            )
+            _profile_log("fit.fallback_multistart", time.perf_counter() - t0, profile_context)
+            fallback_sse = score_result_on_task(fallback_task, fallback_result)
+            if (
+                fallback_result.success
+                and np.isfinite(fallback_sse)
+                and fallback_sse <= baseline_window_sse * (1.0 + 1e-8)
+            ):
+                refined_result = fallback_result
+                refined_window_sse = fallback_sse
+                refined_is_acceptable = True
+
+        if refined_is_acceptable:
+            result = refined_result
+            mask = fit_window_meta.get('_mask')
+            if mask is not None:
+                x_for_fitting = np.asarray(task['x_for_fitting'])[mask]
+                y_for_fitting = np.asarray(task['y_for_fitting'])[mask]
+            else:
+                x_for_fitting = np.asarray(refined_task['x_for_fitting']) / fit_scale
+                y_for_fitting = refined_task['y_for_fitting']
+        else:
+            fit_window_meta = None
+
+    result = _convert_fit_result_to_seconds(
+        result,
+        task['model'],
+        fit_scale,
+        x_for_fitting,
+        y_for_fitting
+    )
+    if fit_window_meta is not None:
+        if '_mask' in fit_window_meta:
+            del fit_window_meta['_mask']
+        fit_window_meta['tau'] = fit_window_meta['tau'] / fit_scale
+        fit_window_meta['x_limit'] = fit_window_meta['x_limit'] / fit_scale
+
+    _profile_log("fit.total", time.perf_counter() - profile_start, profile_context)
+    return {
+        'result': result,
+        'model': task['model'],
+        'x_for_display': task['x_for_display'],
+        'y_for_display': task['y_for_display'],
+        'x_for_fitting': x_for_fitting,
+        'y_for_fitting': y_for_fitting,
+        'fit_window_meta': fit_window_meta
+    }
+
+def _batch_clean_dataframe(df):
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df = df.dropna()
+    return df.values if not df.empty else None
+
+def _batch_is_data_line(line, column1, column2):
+    line = line.strip()
+    if not line:
+        return False
+
+    parts = line.split(',')
+    if len(parts) <= max(column1, column2):
+        return False
+
+    try:
+        val1 = parts[column1].strip()
+        val2 = parts[column2].strip()
+        if not val1 or not val2:
+            return False
+        float(val1)
+        float(val2)
+        return True
+    except (ValueError, IndexError):
+        return False
+
+def _batch_process_data_line(line, column1, column2):
+    line = line.strip()
+    if not line:
+        return None
+
+    parts = None
+    for sep in [',', '\t', ' ']:
+        candidate = line.split(sep)
+        if len(candidate) > max(column1, column2):
+            parts = [p.strip() for p in candidate if p.strip()]
+            break
+
+    if parts is None or len(parts) <= max(column1, column2):
+        return None
+
+    try:
+        val1 = parts[column1].replace('"', '').replace("'", "").strip()
+        val2 = parts[column2].replace('"', '').replace("'", "").strip()
+        return [float(val1), float(val2)]
+    except (ValueError, IndexError):
+        return None
+
+def _batch_load_file_manually(file_path, column1, column2, data_start_row):
+    valid_data = []
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    start_processing = False
+    for line_count, line in enumerate(lines, start=1):
+        if data_start_row is not None:
+            if line_count <= data_start_row:
+                continue
+            start_processing = True
+        elif not start_processing:
+            if _batch_is_data_line(line, column1, column2):
+                start_processing = True
+            else:
+                continue
+
+        row = _batch_process_data_line(line, column1, column2)
+        if row is not None:
+            valid_data.append(row)
+
+    return np.array(valid_data, dtype=float) if valid_data else None
+
+def _batch_load_text_data_auto(file_path, column1, column2):
+    try:
+        df = pd.read_csv(file_path, header=None, dtype=str)
+        data_start_row = 0
+        for i in range(len(df)):
+            try:
+                val1 = df.iloc[i, column1]
+                val2 = df.iloc[i, column2]
+                if pd.notna(val1) and pd.notna(val2) and val1.strip() and val2.strip():
+                    float(val1)
+                    float(val2)
+                    data_start_row = i
+                    break
+            except (ValueError, TypeError):
+                continue
+
+        data = pd.read_csv(
+            file_path,
+            header=None,
+            skiprows=data_start_row,
+            usecols=[column1, column2],
+            dtype=str
+        )
+        return _batch_clean_dataframe(data)
+    except Exception:
+        return None
+
+def _batch_load_excel_data(file_path, column1, column2, data_start_row=None):
+    try:
+        if data_start_row is not None:
+            data = pd.read_excel(file_path, skiprows=data_start_row).iloc[:, [column1, column2]]
+        else:
+            data = pd.read_excel(file_path).iloc[:, [column1, column2]]
+        return _batch_clean_dataframe(data)
+    except Exception:
+        return None
+
+def _batch_load_file_data(file_path, settings):
+    column1 = int(settings['column1']) - 1
+    column2 = int(settings['column2']) - 1
+    if column1 < 0 or column2 < 0:
+        raise ValueError("列号必须为正整数")
+
+    read_mode = settings['read_mode']
+    row_mode = read_mode == '行'
+    data_start_row = None
+    if row_mode:
+        data_start_row = int(settings['data_start_row']) - 1
+        if data_start_row < 0:
+            raise ValueError("起始行必须为正整数")
+
+    lower_name = file_path.lower()
+    data = None
+    if not row_mode:
+        if lower_name.endswith(('.txt', '.csv')):
+            data = _batch_load_text_data_auto(file_path, column1, column2)
+            if data is None:
+                data = _batch_load_file_manually(file_path, column1, column2, None)
+        elif lower_name.endswith(('.xlsx', '.xls')):
+            data = _batch_load_excel_data(file_path, column1, column2)
+    else:
+        if lower_name.endswith(('.txt', '.csv')):
+            data = _batch_load_file_manually(file_path, column1, column2, data_start_row)
+        elif lower_name.endswith(('.xlsx', '.xls')):
+            data = _batch_load_excel_data(file_path, column1, column2, data_start_row)
+
+    if data is None:
+        raise ValueError("无法读取有效数据")
+    return np.asarray(data, dtype=float)
+
+def _batch_filter_display_data(x, y, settings):
+    x_display = np.asarray(x)
+    y_display = np.asarray(y)
+    x_min = settings.get('x_min')
+    x_max = settings.get('x_max')
+    if x_min is not None:
+        mask = x_display >= x_min
+        x_display = x_display[mask]
+        y_display = y_display[mask]
+    if x_max is not None:
+        mask = x_display <= x_max
+        x_display = x_display[mask]
+        y_display = y_display[mask]
+    return x_display, y_display
+
+def _batch_data_range(x, y_data, settings):
+    x = np.asarray(x)
+    y_data = np.asarray(y_data)
+    x_mask = np.ones_like(x, dtype=bool)
+
+    x_min = settings.get('x_min')
+    x_max = settings.get('x_max')
+    if x_min is not None:
+        x_mask &= (x >= x_min)
+    if x_max is not None:
+        x_mask &= (x <= x_max)
+
+    x_filtered = x[x_mask]
+    y_filtered = y_data[x_mask]
+    if len(x_filtered) == 0:
+        return np.array([]), np.array([])
+
+    vrange = np.max(y_filtered) - np.min(y_filtered)
+    upper_text = settings.get('y_upper_text', '')
+    lower_text = settings.get('y_lower_text', '')
+
+    if upper_text and upper_text.lower() == '最大值':
+        max_idx = np.argmax(y_filtered)
+        x_filtered = x_filtered[max_idx:]
+        y_filtered = y_filtered[max_idx:]
+
+    if lower_text and lower_text.lower() == '最小值':
+        min_idx = np.argmin(y_filtered)
+        x_filtered = x_filtered[:min_idx + 1]
+        y_filtered = y_filtered[:min_idx + 1]
+
+    if upper_text and upper_text.lower() != '最大值':
+        try:
+            y_max = float(upper_text) * vrange * 0.01
+            mask = (y_filtered <= y_max)
+            x_filtered = x_filtered[mask]
+            y_filtered = y_filtered[mask]
+        except ValueError:
+            pass
+
+    if lower_text and lower_text.lower() != '最小值':
+        try:
+            y_min = float(lower_text) * vrange * 0.01
+            mask = (y_filtered >= y_min)
+            x_filtered = x_filtered[mask]
+            y_filtered = y_filtered[mask]
+        except ValueError:
+            pass
+
+    return x_filtered, y_filtered
+
+def _batch_average_lifetime(model, params):
+    try:
+        if model == '单指数' and len(params) >= 2:
+            return float(params[1])
+        if model == '双指数' and len(params) >= 4:
+            a, t1, c, t2 = [float(v) for v in params[:4]]
+            denominator = a * t1 + c * t2
+            if denominator == 0:
+                return None
+            return (a * (t1 ** 2) + c * (t2 ** 2)) / denominator
+    except Exception:
+        return None
+    return None
+
+def _batch_temperature_by_interpolation(lifetime, temperatures, lifetimes):
+    if lifetime is None or not temperatures or not lifetimes:
+        return None
+
+    lifetimes = np.asarray(lifetimes, dtype=float)
+    temperatures = np.asarray(temperatures, dtype=float)
+    sorted_indices = np.argsort(lifetimes)
+    sorted_lifetimes = lifetimes[sorted_indices]
+    sorted_temperatures = temperatures[sorted_indices]
+
+    if len(sorted_lifetimes) < 2:
+        return None
+    if lifetime <= sorted_lifetimes[0]:
+        x0, x1 = sorted_lifetimes[0], sorted_lifetimes[1]
+        y0, y1 = sorted_temperatures[0], sorted_temperatures[1]
+        return y0 + (y1 - y0) / (x1 - x0) * (lifetime - x0)
+    if lifetime >= sorted_lifetimes[-1]:
+        x0, x1 = sorted_lifetimes[-2], sorted_lifetimes[-1]
+        y0, y1 = sorted_temperatures[-2], sorted_temperatures[-1]
+        return y1 + (y1 - y0) / (x1 - x0) * (lifetime - x1)
+    return float(np.interp(lifetime, sorted_lifetimes, sorted_temperatures))
+
+def run_batch_fit_worker(args):
+    index, file_path, settings = args
+    file_name = os.path.basename(file_path)
+    profile_start = time.perf_counter()
+    try:
+        t0 = time.perf_counter()
+        data = _batch_load_file_data(file_path, settings)
+        _profile_log("worker.load_data", time.perf_counter() - t0, file_name)
+        if len(data.shape) != 2 or data.shape[1] < 2 or len(data) == 0:
+            raise ValueError(f"数据格式不正确: {data.shape}")
+
+        t0 = time.perf_counter()
+        original_x = data[:, 0]
+        original_y = data[:, 1]
+        x_for_display, y_for_display = _batch_filter_display_data(original_x, original_y, settings)
+        x_fit, y_fit = _batch_data_range(original_x, original_y, settings)
+        _profile_log("worker.filter_data", time.perf_counter() - t0, file_name)
+        if len(x_fit) < 2:
+            raise ValueError("筛选后的数据点不足")
+
+        t0 = time.perf_counter()
+        model = settings['model']
+        temp_fitter = MATLABCurveFitter()
+        smart_p0 = temp_fitter._get_default_start_point(model, x_fit, y_fit)
+        start = smart_p0
+        _profile_log("worker.start_point", time.perf_counter() - t0, file_name)
+
+        t0 = time.perf_counter()
+        task = {
+            'file_path': file_path,
+            'model': model,
+            'x_for_display': x_for_display,
+            'y_for_display': y_for_display,
+            'x_for_fitting': x_fit,
+            'y_for_fitting': y_fit,
+            'start': start,
+            'lower': settings['lower'],
+            'upper': settings['upper'],
+            'fit_options': settings['fit_options'],
+            'fit_window_tau_multiple': settings['fit_window_tau_multiple'],
+            'fit_internal_unit': settings.get('fit_internal_unit', DEFAULT_FIT_INTERNAL_UNIT),
+            'multi_start_enabled': settings.get('multi_start_enabled', True),
+            'robust_text': settings['robust_text'],
+            'algorithm_text': settings['algorithm_text']
+        }
+        _profile_log("worker.build_task", time.perf_counter() - t0, file_name)
+
+        t0 = time.perf_counter()
+        fit_output = run_fit_task(task)
+        _profile_log("worker.run_fit_task", time.perf_counter() - t0, file_name)
+        result = fit_output['result']
+        if not result.success:
+            return {'index': index, 'file_name': file_name, 'success': False, 'error': result.message}
+
+        t0 = time.perf_counter()
+        avg_lifetime = _batch_average_lifetime(model, result.params)
+        temperature = _batch_temperature_by_interpolation(
+            avg_lifetime,
+            settings.get('temperature_calibration', []),
+            settings.get('lifetime_calibration', [])
+        )
+        _profile_log("worker.postprocess", time.perf_counter() - t0, file_name)
+        _profile_log("worker.total", time.perf_counter() - profile_start, file_name)
+
+        return {
+            'index': index,
+            'file_name': file_name,
+            'success': True,
+            'result_data': {
+                'file_name': file_name,
+                'model_type': model,
+                'params': result.params.copy() if result.params is not None else [],
+                'param_names': result.param_names.copy() if result.param_names is not None else [],
+                'sse': result.sse,
+                'rsquare': result.rsquare,
+                'adjrsquare': result.adjrsquare,
+                'rmse': result.rmse,
+                'success': result.success,
+                'avg_lifetime': avg_lifetime,
+                'temperature': temperature
+            }
+        }
+    except Exception as e:
+        _profile_log("worker.failed_total", time.perf_counter() - profile_start, file_name)
+        return {'index': index, 'file_name': file_name, 'success': False, 'error': str(e)}
+
+class FitWorker(QObject):
+    """后台拟合worker，避免阻塞主线程事件循环。"""
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+        self._cancel_requested = False
+
+    def request_cancel(self):
+        self._cancel_requested = True
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            output = run_fit_task(self.task, cancel_check=lambda: self._cancel_requested)
+            if self._cancel_requested:
+                self.cancelled.emit()
+                return
+            self.finished.emit(output)
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
 class mainWindow(QMainWindow, main_window):
     def __init__(self, parent=None, product_names=None):
         super(mainWindow, self).__init__(parent)
         self.setupUi(self)
-        
+        self._initialize_average_lifetime_controls()
+        self.comboBox.currentTextChanged.connect(
+            self._sync_constraint_ui_for_model
+        )
+        self._sync_constraint_ui_for_model(self.comboBox.currentText())
+
         # 使用常量初始化
         self.temperature_calibration = [50,100,150,200,250,300,350,400,450,500,550,600]
         self.lifetime_calibration = [3.646040506,3.212977315,2.842532971,2.519596718,2.236712857,1.981563617,1.710492252,1.280798396,0.688913014,0.379551499,0.321295208,0.317258355]
@@ -500,10 +1681,79 @@ class mainWindow(QMainWindow, main_window):
         # 恢复设置
         self.restore_previous_settings()
 
+        self.comboBox.currentTextChanged.connect(self._on_model_changed)
+
+    def _sync_constraint_ui_for_model(self, model):
+        """
+        根据拟合模型，同步“系数约束”UI 状态
+        """
+        double_only_widgets = [
+            self.lineEdit_15,  # A2 初始
+            self.lineEdit_13,  # A2 下限
+            self.lineEdit_18,  # A2 上限
+            self.lineEdit_25,  # τ2 初始
+            self.lineEdit_34,  # τ2 下限
+            self.lineEdit_35,  # τ2 上限
+            self.label_22,     # A2
+            self.label_7 ,      # τ2
+            self.label_42,
+            self.label_43,
+            self.lineEdit_26,
+            self.lineEdit_28  
+        ]
+        avg_lifetime_widgets = [
+            getattr(self, "label_avg_lifetime", None),
+            getattr(self, "lineEdit_avg_lifetime", None)
+        ]
+        double_only_widgets.extend([w for w in avg_lifetime_widgets if w is not None])
+        # UI 可能已将 label_50/51 替换为 comboBox，使用可选访问避免属性错误
+        label_tau2_unit = getattr(self, "label_50", None)
+        if label_tau2_unit is not None:
+            double_only_widgets.append(label_tau2_unit)
+
+        if model == '单指数':
+            for w in double_only_widgets:
+                w.setVisible(False)
+                if isinstance(w, QtWidgets.QLineEdit):
+                    w.clear()
+            combo_tau2 = getattr(self, "comboBox_12", None)
+            if combo_tau2 is not None:
+                combo_tau2.setVisible(False)
+
+        else:  # 双指数
+            for w in double_only_widgets:
+                w.setVisible(True)
+            combo_tau2 = getattr(self, "comboBox_12", None)
+            if combo_tau2 is not None:
+                combo_tau2.setVisible(True)
+
+    def _initialize_average_lifetime_controls(self):
+        """在双指数系数估计区域增加平均寿命显示。"""
+        if hasattr(self, 'lineEdit_avg_lifetime'):
+            return
+
+        self.label_avg_lifetime = QtWidgets.QLabel("平均寿命", self.page_6)
+        self.label_avg_lifetime.setMinimumSize(QtCore.QSize(30, 0))
+        self.label_avg_lifetime.setMaximumSize(QtCore.QSize(70, 16777215))
+        self.label_avg_lifetime.setObjectName("label_avg_lifetime")
+
+        self.lineEdit_avg_lifetime = QtWidgets.QLineEdit(self.page_6)
+        self.lineEdit_avg_lifetime.setObjectName("lineEdit_avg_lifetime")
+        self.lineEdit_avg_lifetime.setReadOnly(True)
+
+        self.gridLayout_11.addWidget(self.label_avg_lifetime, 12, 0, 1, 1)
+        self.gridLayout_11.addWidget(self.lineEdit_avg_lifetime, 12, 1, 1, 3)
+
+
+    def _on_model_changed(self, text):
+        self.current_model_type = text
+        self._sync_constraint_ui_with_model(text)
+
+
     def _connect_signals(self):
         """集中连接所有信号槽"""
         # 现有连接...
-        self.treeWidget.itemClicked.connect(self.calculate_decay)
+        self.treeWidget.currentItemChanged.connect(self._on_tree_current_item_changed)
         self.comboBox_10.currentIndexChanged.connect(self.comboBox_10_changed)
         self.comboBox.currentIndexChanged.connect(self.fit_curve_model)
         
@@ -528,8 +1778,28 @@ class mainWindow(QMainWindow, main_window):
         # 寿命、温度计算
         self.pushButton_6.clicked.connect(self.calculate_decay)
         
+        # 重置初始值
+        self.pushButton_reset_start.clicked.connect(self.reset_start_point)
+        
         # 新增：导入标定数据
         self.pushButton_4.clicked.connect(self.import_calibration_data)
+
+        # 氧化参数计算（时间输入变化时实时更新）
+        self.lineEdit_39.textChanged.connect(self._on_oxidation_time_changed)
+
+        # τ1/τ2 显示单位切换（若UI中存在 comboBox_11/12）
+        combo_tau1 = getattr(self, "comboBox_11", None)
+        combo_tau2 = getattr(self, "comboBox_12", None)
+        if combo_tau1 is not None:
+            combo_tau1.currentTextChanged.connect(self.change_tau_unit)
+        if combo_tau2 is not None:
+            combo_tau2.currentTextChanged.connect(self.change_tau_unit)
+
+    def _on_tree_current_item_changed(self, current, previous):
+        """切换文件时，使用与手动计算一致的动画流程"""
+        if current is None:
+            return
+        self.calculate_decay(current, show_progress=True)
     
     def import_calibration_data(self):
         """导入标定数据 - CSV格式，包含'温度,寿命'列，并在新窗口显示图像"""
@@ -720,30 +1990,206 @@ class mainWindow(QMainWindow, main_window):
         self.file_data_cache = {}
         self.lifetime = None
         self.temperature_measure = None
+        self.temperature = None
         self.current_model_type = None
         
         # 时间单位
         self.time_unit_5 = 1
         self.time_unit_6 = 1
         self.time_unit_7 = 1
+        self.tau_unit_11 = 1
+        self.tau_unit_12 = 1
+        self.default_fit_window_tau_multiple = 5.0
+        self.default_fit_window_enabled = False
+        self.default_batch_workers = DEFAULT_BATCH_WORKERS
+        self.default_batch_parallel_enabled = False
+        self.default_fit_internal_unit = DEFAULT_FIT_INTERNAL_UNIT
+        self.default_multi_start_enabled = False
         
         # 新增：标定数据相关变量
         self.temperature_calibration = []
         self.lifetime_calibration = []
         self.calibration_window = None
 
+        # 异步拟合相关
+        self._fit_thread = None
+        self._fit_worker = None
+        self._fit_request_id = 0
+        self._fit_progress_dialog = None
+        self.last_fit_window_meta = None
+
     def _initialize_ui(self):
         """初始化UI组件"""
         self.lineEdit_8.setEnabled(False)
         self.lineEdit_3.setEnabled(True)
         self.lineEdit_4.setEnabled(False)
+        if hasattr(self, 'comboBox_9'):
+            self.comboBox_9.setCurrentText("Trust-Region")
         
         # 初始化treeWidget
         self.treeWidget.setHeaderLabels(["文件列表"])
         self.treeWidget.setColumnCount(1)
+        self._initialize_fit_window_controls()
+
+        # 完全隐藏氧化参数区域
+        self._hide_oxidation_section()
+        # 完全隐藏温度显示区域
+        self._hide_temperature_section()
+        # 初始化单位状态
+        self.change_time_unit()
+        self.change_tau_unit()
         
         # 初始化matplotlib图形
         self._setup_matplotlib_canvases()
+
+    def _hide_oxidation_section(self):
+        """完全隐藏氧化参数相关控件。"""
+        widgets = [
+            self.label, self.label_47, self.label_48, self.label_49,
+            self.label_52, self.label_53, self.label_54, self.label_55,
+            self.lineEdit_39, self.lineEdit_40, self.lineEdit_41, self.lineEdit_42
+        ]
+
+        for w in widgets:
+            w.setVisible(False)
+
+        # 清空内容，避免残留
+        self.lineEdit_39.clear()
+        self.lineEdit_40.clear()
+        self.lineEdit_41.clear()
+        self.lineEdit_42.clear()
+
+    def _hide_temperature_section(self):
+        """完全隐藏温度显示相关控件。"""
+        self.groupBox_6.setVisible(False)
+        self.textEdit.clear()
+        self.pushButton_4.setVisible(False)
+
+    def _initialize_fit_window_controls(self):
+        """在拟合设置页增加批量处理和拟合范围输入框。"""
+        if hasattr(self, 'lineEdit_fit_tau_window'):
+            return
+
+        self.label_fit_tau_window = QtWidgets.QLabel("拟合寿命范围(τ)", self.page_2)
+        self.checkBox_fit_tau_window = QtWidgets.QCheckBox("启用拟合寿命范围", self.page_2)
+        self.checkBox_fit_tau_window.setObjectName("checkBox_fit_tau_window")
+        self.checkBox_fit_tau_window.setChecked(self.default_fit_window_enabled)
+        self.lineEdit_fit_tau_window = QtWidgets.QLineEdit(self.page_2)
+        self.lineEdit_fit_tau_window.setObjectName("lineEdit_fit_tau_window")
+        self.lineEdit_fit_tau_window.setText(f"{self.default_fit_window_tau_multiple:g}")
+        self.lineEdit_fit_tau_window.setPlaceholderText("0 表示不限制")
+        fit_window_tooltip = (
+            "开启后：指数模型先全范围预拟合，再按起点到 Nτ 的范围精修；"
+            "单指数使用 τ，双指数使用较大的时间常数。\n"
+            "关闭后：只使用当前筛选范围拟合，不做二次寿命窗口精修。"
+        )
+        self.checkBox_fit_tau_window.setToolTip(fit_window_tooltip)
+        self.lineEdit_fit_tau_window.setToolTip(fit_window_tooltip)
+        validator = QtGui.QDoubleValidator(0.0, 1e6, 6, self.lineEdit_fit_tau_window)
+        validator.setNotation(QtGui.QDoubleValidator.StandardNotation)
+        self.lineEdit_fit_tau_window.setValidator(validator)
+        self.checkBox_fit_tau_window.toggled.connect(self.lineEdit_fit_tau_window.setEnabled)
+
+        self.gridLayout_3.addWidget(self.checkBox_fit_tau_window, 6, 0, 1, 1)
+        self.gridLayout_3.addWidget(self.lineEdit_fit_tau_window, 6, 1, 1, 1)
+        self.label_fit_tau_window_unit = QtWidgets.QLabel("τ", self.page_2)
+        self.label_fit_tau_window_unit.setToolTip(fit_window_tooltip)
+        self.gridLayout_3.addWidget(self.label_fit_tau_window_unit, 6, 2, 1, 1)
+
+        self.label_fit_internal_unit = QtWidgets.QLabel("拟合内部单位", self.page_5)
+        self.comboBox_fit_internal_unit = QtWidgets.QComboBox(self.page_5)
+        self.comboBox_fit_internal_unit.setObjectName("comboBox_fit_internal_unit")
+        self.comboBox_fit_internal_unit.addItems(["μs", "ns", "ms", "s"])
+        self.comboBox_fit_internal_unit.setCurrentText(self.default_fit_internal_unit)
+        self.comboBox_fit_internal_unit.setToolTip(FIT_INTERNAL_UNIT_TOOLTIP)
+        self.label_fit_internal_unit.setToolTip(FIT_INTERNAL_UNIT_TOOLTIP)
+
+        self.gridLayout_10.addWidget(self.label_fit_internal_unit, 9, 0, 1, 1)
+        self.gridLayout_10.addWidget(self.comboBox_fit_internal_unit, 9, 1, 1, 1)
+
+        self.checkBox_multi_start = QtWidgets.QCheckBox("多起点拟合", self.page_5)
+        self.checkBox_multi_start.setObjectName("checkBox_multi_start")
+        self.checkBox_multi_start.setChecked(self.default_multi_start_enabled)
+        self.checkBox_multi_start.setToolTip(
+            "开启：默认使用 5 个起点（智能初值 + 4 个扰动初值）降低局部最优风险。\n"
+            "关闭：只用智能初始值，绝大多数同类稳定数据会快很多；如 R²/SSE 异常再开启。"
+        )
+        self.gridLayout_10.addWidget(self.checkBox_multi_start, 10, 0, 1, 2)
+
+        max_workers = max(1, os.cpu_count() or 1)
+        self.checkBox_batch_parallel = QtWidgets.QCheckBox("启用批量并行", self.page_5)
+        self.checkBox_batch_parallel.setObjectName("checkBox_batch_parallel")
+        self.checkBox_batch_parallel.setChecked(self.default_batch_parallel_enabled)
+        self.checkBox_batch_parallel.setToolTip(
+            "开启：全部文件结果保存时使用多进程并行拟合，适合文件较多的批量处理。\n"
+            "关闭：按文件顺序串行拟合，启动更快，便于排查单个文件问题。"
+        )
+        self.label_batch_workers = QtWidgets.QLabel("批量并行数", self.page_5)
+        self.lineEdit_batch_workers = QtWidgets.QLineEdit(self.page_5)
+        self.lineEdit_batch_workers.setObjectName("lineEdit_batch_workers")
+        self.lineEdit_batch_workers.setText(f"{min(self.default_batch_workers, max_workers):g}")
+        self.lineEdit_batch_workers.setPlaceholderText(f"1-{max_workers}")
+        self.lineEdit_batch_workers.setToolTip(
+            "批量保存时同时拟合的文件数；9800X3D 为 8 核 16 线程，实测建议 12 并行。"
+        )
+        self.lineEdit_batch_workers.setValidator(QtGui.QIntValidator(1, max_workers, self.lineEdit_batch_workers))
+        self.checkBox_batch_parallel.toggled.connect(self.lineEdit_batch_workers.setEnabled)
+        self.checkBox_batch_parallel.toggled.connect(self.label_batch_workers.setEnabled)
+
+        self.batch_parallel_row = QtWidgets.QWidget(self.page_5)
+        self.batch_parallel_row_layout = QtWidgets.QHBoxLayout(self.batch_parallel_row)
+        self.batch_parallel_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.batch_parallel_row_layout.addWidget(self.checkBox_batch_parallel)
+        self.batch_parallel_row_layout.addStretch(1)
+        self.batch_parallel_row_layout.addWidget(self.label_batch_workers)
+        self.batch_parallel_row_layout.addWidget(self.lineEdit_batch_workers)
+        self.gridLayout_10.addWidget(self.batch_parallel_row, 11, 0, 1, 2)
+
+        algorithm_note = (
+            "算法说明：Levenberg-Marquardt 不使用任何上下限；"
+            "Trust-Region 使用系数约束和自动物理边界。"
+        )
+        if hasattr(self, 'comboBox_9'):
+            self.comboBox_9.setToolTip(algorithm_note)
+        self.label_fit_settings_help = QtWidgets.QLabel("参数说明", self.page_5)
+        self.label_fit_settings_help.setToolTip("点击问号打开拟合参数说明窗口")
+        self.pushButton_fit_settings_help = QtWidgets.QPushButton("?", self.page_5)
+        self.pushButton_fit_settings_help.setObjectName("pushButton_fit_settings_help")
+        self.pushButton_fit_settings_help.setFixedWidth(28)
+        self.pushButton_fit_settings_help.setToolTip("查看拟合参数说明")
+        self.pushButton_fit_settings_help.clicked.connect(self._show_fit_settings_help)
+        self.gridLayout_10.addWidget(self.label_fit_settings_help, 12, 0, 1, 1)
+        self.gridLayout_10.addWidget(self.pushButton_fit_settings_help, 12, 1, 1, 1)
+
+    def _show_fit_settings_help(self):
+        """显示拟合参数说明。"""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("拟合参数说明")
+        dialog.resize(560, 460)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        text = QtWidgets.QTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setPlainText(
+            "数据筛选\n"
+            "- 启用拟合寿命范围：先做一次预拟合，再按起点到 Nτ 的范围精修；双指数使用较大的 τ。关闭后只使用当前筛选范围。\n\n"
+            "高级设置\n"
+            "- 稳健：Off 为普通最小二乘；LAR/Bisquare 会降低异常点影响，但会切到 Trust-Region。\n"
+            "- 算法：Levenberg-Marquardt 不使用任何上下限；Trust-Region 使用系数约束和自动物理边界。 优先建议使用 Trust-Region，拟合效果更好\n"
+            "- 最小/最大差分步长：数值差分相关设置；通常不用调整。\n"
+            "- 最大函数评估次数/最大迭代次数：越大越可能收敛，但耗时更久。\n"
+            "- 函数/参数容差：越小越严格，耗时可能增加。\n"
+            "- 拟合内部单位：只改变优化器内部的时间尺度，结果仍按秒保存和按显示单位显示。寿命约 1-10000 μs 时建议 μs。\n"
+            "- 多起点拟合：开启后默认使用 5 个起点（智能初值 + 4 个扰动初值），降低局部最优风险；关闭时只用 1 个智能初值，最快。\n"
+            "- 速度参考：约 1M 点数据下，单个起点LM算法拟合约 1 s，TR算法约 4 s，实际耗时随模型、窗口、CPU 状态变化。\n"
+            "- 启用批量并行：批量保存时多进程同时拟合多个文件；文件少或排查问题时可关闭。9800X3D 为 8 核 16 线程，建议 12 并行作为起点。\n\n"
+            )
+        layout.addWidget(text)
+
+        close_button = QtWidgets.QPushButton("关闭", dialog)
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+        dialog.exec_()
 
     def _setup_matplotlib_canvases(self):
         """设置matplotlib画布 - 最小化工具栏版本"""
@@ -862,6 +2308,63 @@ class mainWindow(QMainWindow, main_window):
             'TolX': self._safe_float_conversion(self.lineEdit_24.text(), DEFAULT_FIT_OPTIONS['TolX'])
         }
 
+    def get_fit_window_tau_multiple(self):
+        """读取按 τ 倍数限制的拟合时间范围。"""
+        enabled_widget = getattr(self, 'checkBox_fit_tau_window', None)
+        if enabled_widget is not None and not enabled_widget.isChecked():
+            return 0.0
+
+        widget = getattr(self, 'lineEdit_fit_tau_window', None)
+        if widget is None:
+            return self.default_fit_window_tau_multiple
+
+        text = widget.text().strip()
+        if not text:
+            return self.default_fit_window_tau_multiple
+
+        try:
+            value = float(text)
+        except ValueError:
+            return self.default_fit_window_tau_multiple
+
+        return max(0.0, value)
+
+    def get_batch_worker_count(self):
+        """读取批量处理并行数。"""
+        max_workers = max(1, os.cpu_count() or 1)
+        widget = getattr(self, 'lineEdit_batch_workers', None)
+        if widget is None:
+            return min(self.default_batch_workers, max_workers)
+
+        try:
+            value = int(widget.text().strip())
+        except ValueError:
+            value = self.default_batch_workers
+
+        return max(1, min(max_workers, value))
+
+    def is_batch_parallel_enabled(self):
+        """读取是否启用批量并行。"""
+        widget = getattr(self, 'checkBox_batch_parallel', None)
+        if widget is None:
+            return self.default_batch_parallel_enabled
+        return widget.isChecked()
+
+    def get_fit_internal_unit(self):
+        """读取拟合内部时间单位。"""
+        widget = getattr(self, 'comboBox_fit_internal_unit', None)
+        if widget is None:
+            return self.default_fit_internal_unit
+        text = widget.currentText()
+        return text if text in UNIT_MAPPING else self.default_fit_internal_unit
+
+    def is_multi_start_enabled(self):
+        """读取是否启用多起点拟合。"""
+        widget = getattr(self, 'checkBox_multi_start', None)
+        if widget is None:
+            return self.default_multi_start_enabled
+        return widget.isChecked()
+
     def _get_file_filters(self):
         """获取文件过滤器"""
         return (
@@ -913,6 +2416,64 @@ class mainWindow(QMainWindow, main_window):
         self.time_unit_5 = UNIT_MAPPING[text_5]
         self.time_unit_6 = UNIT_MAPPING[text_6]
         self.time_unit_7 = UNIT_MAPPING[text_7]
+
+    def change_tau_unit(self):
+        """更新 τ1/τ2 的显示单位并刷新结果显示。"""
+        combo_tau1 = getattr(self, "comboBox_11", None)
+        combo_tau2 = getattr(self, "comboBox_12", None)
+
+        if combo_tau1 is not None:
+            self.tau_unit_11 = UNIT_MAPPING.get(combo_tau1.currentText(), 1)
+        else:
+            self.tau_unit_11 = 1
+
+        if combo_tau2 is not None:
+            self.tau_unit_12 = UNIT_MAPPING.get(combo_tau2.currentText(), 1)
+        else:
+            self.tau_unit_12 = 1
+
+        self._refresh_tau_display_from_result()
+
+    def _refresh_tau_display_from_result(self):
+        """根据当前拟合结果和单位设置刷新 τ1/τ2 显示。"""
+        if not (hasattr(self, 'result') and self.result and self.result.params is not None):
+            return
+
+        try:
+            model = self.current_model_type or self.comboBox.currentText()
+            if model == '单指数' and len(self.result.params) >= 2:
+                tau1 = float(self.result.params[1])
+                self.lineEdit.setText(f"{tau1 * self.tau_unit_11:.5e}")
+                self.lineEdit_28.clear()
+                if hasattr(self, 'lineEdit_avg_lifetime'):
+                    self.lineEdit_avg_lifetime.clear()
+            elif model == '双指数' and len(self.result.params) >= 4:
+                t1 = float(self.result.params[1])
+                t2 = float(self.result.params[3])
+                self.lineEdit.setText(f"{t1 * self.tau_unit_11:.5e}")
+                self.lineEdit_28.setText(f"{t2 * self.tau_unit_12:.5e}")
+                avg_lifetime = self._calculate_double_exp_average_lifetime(self.result.params)
+                if avg_lifetime is not None and hasattr(self, 'lineEdit_avg_lifetime'):
+                    self.lineEdit_avg_lifetime.setText(f"{avg_lifetime * self.tau_unit_11:.5e}")
+        except Exception as e:
+            print(f"刷新τ显示单位时出错: {str(e)}")
+
+    def _get_time_thresholds_in_seconds(self):
+        """
+        读取时间阈值并转换到秒(s)。
+        lineEdit_2 对应“大于”(comboBox_5)
+        lineEdit_5 对应“小于”(comboBox_6)
+        """
+        x_min = None
+        x_max = None
+
+        if self.lineEdit_2.text():
+            x_min = float(self.lineEdit_2.text()) / float(self.time_unit_5)
+
+        if self.lineEdit_5.text():
+            x_max = float(self.lineEdit_5.text()) / float(self.time_unit_6)
+
+        return x_min, x_max
     
     def fit_curve_model(self):
         text = self.comboBox.currentText()
@@ -940,6 +2501,34 @@ class mainWindow(QMainWindow, main_window):
         if last_download_dir and os.path.exists(last_download_dir):
             self.pushButton_3.setText(last_download_dir)
         last_img_dir = self.settings.value("last_img_directory", "")
+        batch_workers = self.settings.value("batch_workers", "")
+        if batch_workers and hasattr(self, 'lineEdit_batch_workers'):
+            self.lineEdit_batch_workers.setText(str(batch_workers))
+        batch_parallel_enabled = self.settings.value("batch_parallel_enabled", None)
+        if batch_parallel_enabled is not None and hasattr(self, 'checkBox_batch_parallel'):
+            enabled = str(batch_parallel_enabled).lower() in ("true", "1", "yes")
+            self.checkBox_batch_parallel.setChecked(enabled)
+            self.lineEdit_batch_workers.setEnabled(enabled)
+            self.label_batch_workers.setEnabled(enabled)
+        fit_internal_unit = self.settings.value("fit_internal_unit", "")
+        if fit_internal_unit and hasattr(self, 'comboBox_fit_internal_unit'):
+            if self.comboBox_fit_internal_unit.findText(str(fit_internal_unit)) >= 0:
+                self.comboBox_fit_internal_unit.setCurrentText(str(fit_internal_unit))
+        fit_window_enabled = self.settings.value("fit_window_enabled", None)
+        if fit_window_enabled is not None and hasattr(self, 'checkBox_fit_tau_window'):
+            enabled = str(fit_window_enabled).lower() in ("true", "1", "yes")
+            self.checkBox_fit_tau_window.setChecked(enabled)
+            self.lineEdit_fit_tau_window.setEnabled(enabled)
+        fit_window_tau_multiple = self.settings.value("fit_window_tau_multiple", "")
+        if fit_window_tau_multiple and hasattr(self, 'lineEdit_fit_tau_window'):
+            self.lineEdit_fit_tau_window.setText(str(fit_window_tau_multiple))
+        multi_start_enabled = self.settings.value("multi_start_enabled", None)
+        if multi_start_enabled is not None and hasattr(self, 'checkBox_multi_start'):
+            self.checkBox_multi_start.setChecked(str(multi_start_enabled).lower() in ("true", "1", "yes"))
+        algorithm_text = self.settings.value("fit_algorithm", "")
+        if algorithm_text and hasattr(self, 'comboBox_9'):
+            if self.comboBox_9.findText(str(algorithm_text)) >= 0:
+                self.comboBox_9.setCurrentText(str(algorithm_text))
 
         
         # 恢复文件列表
@@ -1023,6 +2612,19 @@ class mainWindow(QMainWindow, main_window):
                     file_list.append(file_path)
             
             self.settings.setValue("last_file_list", file_list)
+            if hasattr(self, 'lineEdit_batch_workers'):
+                self.settings.setValue("batch_workers", self.get_batch_worker_count())
+            if hasattr(self, 'checkBox_batch_parallel'):
+                self.settings.setValue("batch_parallel_enabled", self.is_batch_parallel_enabled())
+            if hasattr(self, 'comboBox_fit_internal_unit'):
+                self.settings.setValue("fit_internal_unit", self.get_fit_internal_unit())
+            if hasattr(self, 'checkBox_fit_tau_window'):
+                self.settings.setValue("fit_window_enabled", self.checkBox_fit_tau_window.isChecked())
+                self.settings.setValue("fit_window_tau_multiple", self.lineEdit_fit_tau_window.text().strip())
+            if hasattr(self, 'checkBox_multi_start'):
+                self.settings.setValue("multi_start_enabled", self.is_multi_start_enabled())
+            if hasattr(self, 'comboBox_9'):
+                self.settings.setValue("fit_algorithm", self.comboBox_9.currentText())
         except Exception as e:
             print(f"保存设置时出错: {str(e)}")
 
@@ -1129,11 +2731,190 @@ class mainWindow(QMainWindow, main_window):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存结果时出错: {str(e)}")
             traceback.print_exc()
+
+    def _create_batch_settings_snapshot(self):
+        """创建批量子进程所需的纯数据设置快照。"""
+        model = self.comboBox.currentText()
+        if model == '单指数':
+            lower = self._read_param_block([self.lineEdit_11, self.lineEdit_12, self.lineEdit_37])
+            upper = self._read_param_block([self.lineEdit_16, self.lineEdit_17, self.lineEdit_38])
+        else:
+            lower = self._read_param_block([
+                self.lineEdit_11, self.lineEdit_12, self.lineEdit_13, self.lineEdit_34, self.lineEdit_37
+            ])
+            upper = self._read_param_block([
+                self.lineEdit_16, self.lineEdit_17, self.lineEdit_18, self.lineEdit_35, self.lineEdit_38
+            ])
+
+        x_min, x_max = self._get_time_thresholds_in_seconds()
+        return {
+            'model': model,
+            'column1': self.lineEdit_9.text(),
+            'column2': self.lineEdit_10.text(),
+            'read_mode': self.comboBox_10.currentText(),
+            'data_start_row': self.lineEdit_8.text(),
+            'x_min': x_min,
+            'x_max': x_max,
+            'y_lower_text': self.lineEdit_3.text(),
+            'y_upper_text': self.lineEdit_4.text(),
+            'lower': lower,
+            'upper': upper,
+            'fit_options': self.get_fit_options(),
+            'fit_window_tau_multiple': self.get_fit_window_tau_multiple(),
+            'fit_internal_unit': self.get_fit_internal_unit(),
+            'multi_start_enabled': self.is_multi_start_enabled(),
+            'robust_text': self.comboBox_8.currentText(),
+            'algorithm_text': self.comboBox_9.currentText(),
+            'temperature_calibration': list(getattr(self, 'temperature_calibration', [])),
+            'lifetime_calibration': list(getattr(self, 'lifetime_calibration', []))
+        }
+
+    def _write_all_results_file(self, all_results):
+        t0 = time.perf_counter()
+        timestamp = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd_hhmmss")
+        output_file = os.path.join(self.download_directory, f"decay_results_{timestamp}.txt")
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            header = self._generate_header(all_results[0])
+            f.write(header + '\n')
+            for result in all_results:
+                line = self._format_result_line(result)
+                f.write(line + '\n')
+
+        _profile_log("batch.write_results", time.perf_counter() - t0)
+        return output_file
+
+    def _save_all_parallel(self, file_count, worker_count):
+        """使用进程池并行处理批量拟合。"""
+        batch_start = time.perf_counter()
+        progress_dialog = QtWidgets.QDialog(self)
+        progress_dialog.setWindowTitle("处理进度")
+        progress_dialog.setFixedSize(440, 170)
+        progress_dialog.setModal(True)
+        progress_dialog._cancelled = False
+
+        layout = QtWidgets.QVBoxLayout(progress_dialog)
+        current_file_label = QtWidgets.QLabel(f"准备并行处理，进程数: {worker_count}")
+        current_file_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(current_file_label)
+
+        progress_bar = QtWidgets.QProgressBar()
+        progress_bar.setRange(0, file_count)
+        layout.addWidget(progress_bar)
+
+        progress_text = QtWidgets.QLabel(f"0/{file_count}")
+        progress_text.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(progress_text)
+
+        cancel_button = QtWidgets.QPushButton("取消")
+        def _cancel_save_all():
+            progress_dialog._cancelled = True
+            cancel_button.setEnabled(False)
+            current_file_label.setText("正在取消未开始的任务...")
+        cancel_button.clicked.connect(_cancel_save_all)
+        layout.addWidget(cancel_button)
+
+        progress_dialog.show()
+        QtWidgets.QApplication.processEvents()
+
+        t0 = time.perf_counter()
+        settings = self._create_batch_settings_snapshot()
+        tasks = []
+        for i in range(file_count):
+            item = self.treeWidget.topLevelItem(i)
+            file_path = item.data(0, QtCore.Qt.UserRole)
+            tasks.append((i, file_path, settings))
+        _profile_log("batch.prepare_tasks", time.perf_counter() - t0)
+
+        all_results = []
+        completed = 0
+        cancelled = False
+
+        try:
+            current_file_label.setText(f"正在启动 {worker_count} 个拟合进程...")
+            QtWidgets.QApplication.processEvents()
+
+            t0 = time.perf_counter()
+            with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+                task_iter = iter(tasks)
+                future_to_name = {}
+                for _ in range(min(worker_count, len(tasks))):
+                    task = next(task_iter)
+                    future_to_name[executor.submit(run_batch_fit_worker, task)] = os.path.basename(task[1])
+                pending = set(future_to_name)
+                _profile_log("batch.start_process_pool", time.perf_counter() - t0)
+                wait_start = time.perf_counter()
+
+                while pending:
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        timeout=0.15,
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+
+                    if getattr(progress_dialog, "_cancelled", False):
+                        cancelled = True
+                        for future in pending:
+                            future.cancel()
+                        break
+
+                    for future in done:
+                        completed += 1
+                        file_name = future_to_name[future]
+                        del future_to_name[future]
+                        progress_bar.setValue(completed)
+                        progress_text.setText(f"{completed}/{file_count}")
+                        current_file_label.setText(f"完成: {file_name}")
+
+                        try:
+                            output = future.result()
+                            if output.get('success'):
+                                all_results.append((output['index'], output['result_data']))
+                                print(f"成功收集文件 {output['file_name']} 的拟合结果")
+                            else:
+                                print(f"处理文件 {output.get('file_name', file_name)} 失败: {output.get('error')}")
+                        except Exception as e:
+                            print(f"处理文件 {file_name} 失败: {str(e)}")
+
+                        if not getattr(progress_dialog, "_cancelled", False):
+                            try:
+                                task = next(task_iter)
+                                new_future = executor.submit(run_batch_fit_worker, task)
+                                future_to_name[new_future] = os.path.basename(task[1])
+                                pending.add(new_future)
+                            except StopIteration:
+                                pass
+
+                    QtWidgets.QApplication.processEvents()
+                _profile_log("batch.wait_workers", time.perf_counter() - wait_start)
+
+        except Exception as e:
+            progress_dialog.close()
+            QMessageBox.critical(self, "错误", f"并行批量处理失败: {str(e)}")
+            traceback.print_exc()
+            return
+
+        progress_dialog.close()
+
+        if cancelled:
+            QMessageBox.information(self, "提示", "操作已取消")
+            return
+
+        if not all_results:
+            QMessageBox.warning(self, "警告", "没有可保存的结果")
+            return
+
+        all_results = [result for _, result in sorted(all_results, key=lambda item: item[0])]
+        output_file = self._write_all_results_file(all_results)
+        _profile_log("batch.total", time.perf_counter() - batch_start)
+        QMessageBox.information(self, "完成", f"结果已保存到: {output_file}")
+        print(f"结果已保存到: {output_file}")
         
     def save_all(self):
         """保存所有文件的衰减计算结果到txt文件 - 详细进度版本"""
         
         try:
+            serial_batch_start = time.perf_counter()
             # 检查是否有文件需要处理
             file_count = self.treeWidget.topLevelItemCount()
             if file_count == 0:
@@ -1146,12 +2927,18 @@ class mainWindow(QMainWindow, main_window):
             if not self.download_directory or not os.path.exists(self.download_directory):
                 QMessageBox.warning(self, "警告", "请先设置有效的保存目录")
                 return
+
+            worker_count = self.get_batch_worker_count()
+            self.save_current_settings()
+            if self.is_batch_parallel_enabled() and worker_count > 1:
+                return self._save_all_parallel(file_count, worker_count)
             
             # 创建自定义进度对话框
             progress_dialog = QtWidgets.QDialog(self)
             progress_dialog.setWindowTitle("处理进度")
             progress_dialog.setFixedSize(400, 150)
             progress_dialog.setModal(True)
+            progress_dialog._cancelled = False
             
             layout = QtWidgets.QVBoxLayout(progress_dialog)
             
@@ -1172,7 +2959,10 @@ class mainWindow(QMainWindow, main_window):
             
             # 取消按钮
             cancel_button = QtWidgets.QPushButton("取消")
-            cancel_button.clicked.connect(progress_dialog.reject)
+            def _cancel_save_all():
+                progress_dialog._cancelled = True
+                progress_dialog.reject()
+            cancel_button.clicked.connect(_cancel_save_all)
             layout.addWidget(cancel_button)
             
             progress_dialog.show()
@@ -1183,11 +2973,7 @@ class mainWindow(QMainWindow, main_window):
             
             # 遍历所有文件
             for i in range(file_count):
-                # 检查是否取消
-                if progress_dialog.wasCanceled():
-                    cancelled = True
-                    break
-                
+                file_start = time.perf_counter()
                 item = self.treeWidget.topLevelItem(i)
                 file_path = item.data(0, QtCore.Qt.UserRole)
                 file_name = os.path.basename(file_path)
@@ -1199,6 +2985,11 @@ class mainWindow(QMainWindow, main_window):
                 progress_text.setText(f"{i+1}/{file_count}")
                 
                 QtWidgets.QApplication.processEvents()
+                
+                # 检查是否取消（QDialog 无 wasCanceled）
+                if getattr(progress_dialog, "_cancelled", False):
+                    cancelled = True
+                    break
 
                 print(f"文件路径: {self.file_path}")
 
@@ -1214,6 +3005,7 @@ class mainWindow(QMainWindow, main_window):
                     continue
                 
                 # 如果有标定数据，计算温度
+                avg_lifetime = None
                 if (hasattr(self, 'temperature_calibration') and self.temperature_calibration and
                     hasattr(self, 'lifetime_calibration') and self.lifetime_calibration):
                     try:
@@ -1223,7 +3015,8 @@ class mainWindow(QMainWindow, main_window):
                     except Exception as e:
                         print(f"保存前计算温度时出错: {str(e)}")
                 
-                print(f"平均寿命: {avg_lifetime}")
+                if avg_lifetime is not None:
+                    print(f"平均寿命: {avg_lifetime}")
                 
                 # 收集拟合结果
                 result_data = self._create_result_data(file_name)
@@ -1233,6 +3026,7 @@ class mainWindow(QMainWindow, main_window):
                 else:
                     print(f"收集文件 {file_name} 的拟合结果时出错")
                     continue
+                _profile_log("batch.serial_file_total", time.perf_counter() - file_start, file_name)
             
             progress_dialog.close()
             
@@ -1251,6 +3045,7 @@ class mainWindow(QMainWindow, main_window):
             output_file = os.path.join(self.download_directory, f"decay_results_{timestamp}.txt")
             
             # 写入文件
+            t0 = time.perf_counter()
             with open(output_file, 'w', encoding='utf-8') as f:
                 # 写入表头
                 header = self._generate_header(all_results[0])
@@ -1260,6 +3055,8 @@ class mainWindow(QMainWindow, main_window):
                 for result in all_results:
                     line = self._format_result_line(result)
                     f.write(line + '\n')
+            _profile_log("batch.write_results", time.perf_counter() - t0)
+            _profile_log("batch.serial_total", time.perf_counter() - serial_batch_start)
             
             QMessageBox.information(self, "完成", f"结果已保存到: {output_file}")
             print(f"结果已保存到: {output_file}")
@@ -1657,13 +3454,12 @@ class mainWindow(QMainWindow, main_window):
             x_mask = np.ones_like(x, dtype=bool)
             y_mask = np.ones_like(y_data, dtype=bool)
 
-            # 处理时间范围筛选（x轴范围）
-            if self.lineEdit_2.text():  # x_min
-                x_min = float(self.lineEdit_2.text())
+            # 处理时间范围筛选（x轴范围，统一换算到秒）
+            x_min, x_max = self._get_time_thresholds_in_seconds()
+            if x_min is not None:
                 x_mask &= (x >= x_min)
 
-            if self.lineEdit_5.text():  # x_max
-                x_max = float(self.lineEdit_5.text())
+            if x_max is not None:
                 x_mask &= (x <= x_max)
             
             # 应用时间筛选后的数据
@@ -1734,7 +3530,6 @@ class mainWindow(QMainWindow, main_window):
             progress.setWindowTitle("处理中")
             progress.setWindowModality(QtCore.Qt.WindowModal)
             progress.setMinimumDuration(0)  # 立即显示
-            progress.setCancelButton(None)  # 移除取消按钮，防止用户中断重要计算
             progress.show()
             
             # 强制显示进度对话框
@@ -1862,8 +3657,10 @@ class mainWindow(QMainWindow, main_window):
                 progress.repaint()
                 QtWidgets.QApplication.processEvents()
             
+            if show_progress:
+                return self._start_async_fitting(data, file_path, progress)
+
             self._perform_fitting(data, file_path)
-            
             if progress:
                 progress.close()
             return True
@@ -1877,46 +3674,305 @@ class mainWindow(QMainWindow, main_window):
             QMessageBox.critical(self, "错误", error_msg)
             return False
 
-    def _perform_fitting(self, data, file_path):
-        """执行拟合计算的内部方法"""
+    def _set_fitting_ui_busy(self, busy):
+        """异步拟合期间，限制可能触发重复拟合的交互。"""
+        self.pushButton_6.setEnabled(not busy)
+        self.treeWidget.setEnabled(not busy)
+
+    def _start_async_fitting(self, data, file_path, progress):
+        """启动后台拟合线程（仅用于前台交互流程）。"""
         try:
-            Origional_x = data[:, 0]
-            Origional_y_data = data[:, 1]
-            
-            # 创建新的拟合器实例，避免状态污染
-            fitter = MATLABCurveFitter()
+            task = self._build_fit_task(data, file_path)
+            if task is None:
+                if progress:
+                    progress.close()
+                return False
 
-            # 配置拟合选项
-            fitter = self._setup_fitter_options(fitter)
+            self._fit_request_id += 1
+            request_id = self._fit_request_id
+            self._fit_progress_dialog = progress
 
-            # 获取模型类型并保存到实例变量中
-            self.current_model_type = self.comboBox.currentText()
-            models_to_test = self.current_model_type
-            print(f"使用模型: {models_to_test}")
+            self._set_fitting_ui_busy(True)
 
-            # 数据范围筛选
-            x, y_data = self.data_range(Origional_x, Origional_y_data)
-            print(f"筛选后数据点数: {len(x)}")
-            
-            if len(x) < 2:
-                QMessageBox.warning(self, "警告", "筛选后的数据点不足，无法进行拟合")
+            thread = QtCore.QThread(self)
+            worker = FitWorker(task)
+            worker.moveToThread(thread)
+
+            thread.started.connect(worker.run)
+            worker.finished.connect(lambda output, rid=request_id: self._on_async_fitting_finished(rid, output))
+            worker.failed.connect(lambda err, rid=request_id: self._on_async_fitting_failed(rid, err))
+            worker.cancelled.connect(lambda rid=request_id: self._on_async_fitting_cancelled(rid))
+
+            worker.finished.connect(thread.quit)
+            worker.failed.connect(thread.quit)
+            worker.cancelled.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            worker.failed.connect(worker.deleteLater)
+            worker.cancelled.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+
+            self._fit_thread = thread
+            self._fit_worker = worker
+            if progress is not None:
+                progress.canceled.connect(self._cancel_async_fitting)
+            thread.start()
+            return True
+        except Exception as e:
+            if progress:
+                progress.close()
+            self._set_fitting_ui_busy(False)
+            error_msg = f"启动后台拟合失败: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            QMessageBox.critical(self, "错误", error_msg)
+            return False
+
+    def _finish_async_fitting_ui(self):
+        """异步拟合完成后恢复UI状态并关闭进度框。"""
+        self._set_fitting_ui_busy(False)
+        if self._fit_progress_dialog:
+            self._fit_progress_dialog.close()
+            self._fit_progress_dialog = None
+
+    def _on_async_fitting_finished(self, request_id, fit_output):
+        """后台拟合完成回调（主线程）。"""
+        try:
+            # 忽略过期结果，避免旧任务覆盖新选择
+            if request_id != self._fit_request_id:
                 return
+            self._apply_fit_output(fit_output)
+        finally:
+            if request_id == self._fit_request_id:
+                self._fit_thread = None
+                self._fit_worker = None
+                self._finish_async_fitting_ui()
 
-            # 执行拟合
-            result = fitter.fit_curve(x, y_data, models_to_test)
-            self.result = result
+    def _on_async_fitting_failed(self, request_id, error_trace):
+        """后台拟合失败回调（主线程）。"""
+        try:
+            if request_id != self._fit_request_id:
+                return
+            print("后台拟合异常:")
+            print(error_trace)
+            QMessageBox.critical(self, "错误", "拟合计算时出错，请查看控制台日志")
+        finally:
+            if request_id == self._fit_request_id:
+                self._fit_thread = None
+                self._fit_worker = None
+                self._finish_async_fitting_ui()
 
-            # 处理拟合结果
-            if result.success:
-                self._handle_fit_result(result, models_to_test, Origional_x, Origional_y_data, x, y_data, fitter)
+    def _on_async_fitting_cancelled(self, request_id):
+        """后台拟合取消回调（主线程）。"""
+        try:
+            if request_id != self._fit_request_id:
+                return
+            print("拟合已取消")
+        finally:
+            if request_id == self._fit_request_id:
+                self._fit_thread = None
+                self._fit_worker = None
+                self._finish_async_fitting_ui()
+
+    def _cancel_async_fitting(self):
+        """用户关闭/取消进度动画时，请求后台拟合停止。"""
+        if self._fit_progress_dialog:
+            self._fit_progress_dialog.setLabelText("正在取消拟合...")
+            self._fit_progress_dialog.repaint()
+            QtWidgets.QApplication.processEvents()
+        if self._fit_worker is not None:
+            self._fit_worker.request_cancel()
+
+    def _build_fit_task(self, data, file_path):
+        """从当前UI状态构建拟合任务数据。"""
+        # =========================
+        # 0️⃣ 原始数据
+        # =========================
+        Origional_x = data[:, 0]
+        Origional_y_data = data[:, 1]
+
+        # =========================
+        # 1️⃣ 当前模型
+        # =========================
+        model = self.comboBox.currentText()
+        self.current_model_type = model
+        print(f"使用模型: {model}")
+
+        # =========================
+        # 2️⃣ 数据筛选 - 保存时间范围内的数据作为背景
+        # =========================
+        x_for_display = np.asarray(Origional_x)
+        y_for_display = np.asarray(Origional_y_data)
+
+        x_min, x_max = self._get_time_thresholds_in_seconds()
+        if x_min is not None:
+            mask = x_for_display >= x_min
+            x_for_display = x_for_display[mask]
+            y_for_display = y_for_display[mask]
+
+        if x_max is not None:
+            mask = x_for_display <= x_max
+            x_for_display = x_for_display[mask]
+            y_for_display = y_for_display[mask]
+
+        x, y_data = self.data_range(Origional_x, Origional_y_data)
+        if len(x) < 2:
+            QMessageBox.warning(self, "警告", "筛选后的数据点不足")
+            return None
+
+        # =========================
+        # 3️⃣ 智能初始值选择
+        # =========================
+        temp_fitter = MATLABCurveFitter()
+        smart_p0 = temp_fitter._get_default_start_point(model, x, y_data)
+
+        if model == '单指数':
+            current_start = self._read_param_block([
+                self.lineEdit_6,
+                self.lineEdit_14,
+                self.lineEdit_36
+            ])
+        else:
+            current_start = self._read_param_block([
+                self.lineEdit_6,
+                self.lineEdit_14,
+                self.lineEdit_15,
+                self.lineEdit_25,
+                self.lineEdit_36
+            ])
+
+        print(f"为当前数据计算智能初始值: {smart_p0}")
+        self._auto_fill_start_point(model, smart_p0)
+
+        is_user_set_values = any(v is not None for v in current_start)
+        if not is_user_set_values:
+            print(f"UI初始值为空，使用智能初始值: {smart_p0}")
+        else:
+            if self._should_update_start_point(current_start, smart_p0, x, y_data):
+                print(f"检测到当前初始值不适合新数据，使用智能初始值: {smart_p0}")
             else:
-                QMessageBox.warning(self, "警告", f"拟合失败: {result.message}")
-                
+                print(f"使用用户设置的初始值: {current_start}")
+
+        # =========================
+        # 4️⃣ 从 UI 读取 Start / Lower / Upper
+        # =========================
+        if model == '单指数':
+            start = self._read_param_block([self.lineEdit_6, self.lineEdit_14, self.lineEdit_36])
+            lower = self._read_param_block([self.lineEdit_11, self.lineEdit_12, self.lineEdit_37])
+            upper = self._read_param_block([self.lineEdit_16, self.lineEdit_17, self.lineEdit_38])
+        else:
+            start = self._read_param_block([
+                self.lineEdit_6, self.lineEdit_14, self.lineEdit_15, self.lineEdit_25, self.lineEdit_36
+            ])
+            lower = self._read_param_block([
+                self.lineEdit_11, self.lineEdit_12, self.lineEdit_13, self.lineEdit_34, self.lineEdit_37
+            ])
+            upper = self._read_param_block([
+                self.lineEdit_16, self.lineEdit_17, self.lineEdit_18, self.lineEdit_35, self.lineEdit_38
+            ])
+
+        return {
+            'file_path': file_path,
+            'model': model,
+            'x_for_display': x_for_display,
+            'y_for_display': y_for_display,
+            'x_for_fitting': x,
+            'y_for_fitting': y_data,
+            'start': start,
+            'lower': lower,
+            'upper': upper,
+            'fit_options': self.get_fit_options(),
+            'fit_window_tau_multiple': self.get_fit_window_tau_multiple(),
+            'fit_internal_unit': self.get_fit_internal_unit(),
+            'multi_start_enabled': self.is_multi_start_enabled(),
+            'robust_text': self.comboBox_8.currentText(),
+            'algorithm_text': self.comboBox_9.currentText()
+        }
+
+    def _apply_fit_output(self, fit_output):
+        """将拟合输出回填到UI。"""
+        result = fit_output['result']
+        self.result = result
+        self.last_fit_window_meta = fit_output.get('fit_window_meta')
+
+        if self.last_fit_window_meta:
+            meta = self.last_fit_window_meta
+            print(
+                f"按寿命范围精修拟合: {meta['tau_multiple']:.3g}τ, "
+                f"τ={meta['tau']:.5e}, 截止时间={meta['x_limit']:.5e}, "
+                f"点数={meta['points_used']}/{meta['points_total']}"
+            )
+
+        if result.success:
+            fitter = MATLABCurveFitter()
+            self._handle_fit_result(
+                result,
+                fit_output['model'],
+                fit_output['x_for_display'],
+                fit_output['y_for_display'],
+                fit_output['x_for_fitting'],
+                fit_output['y_for_fitting'],
+                fitter
+            )
+        else:
+            QMessageBox.warning(self, "警告", f"拟合失败: {result.message}")
+    
+    def _sync_constraint_ui_with_model(self, model):
+        """
+        不依赖 layout 名字，通过控件反查所在布局行，彻底隐藏 A2 / τ2
+        """
+
+        # 任选一个双指数控件，反查 layout
+        ref_widget = self.lineEdit_15  # A2 初始值，一定存在
+        layout = ref_widget.parentWidget().layout()
+
+        if layout is None:
+            print("⚠️ 未找到系数约束的 layout")
+            return
+
+        # 找 A2 / τ2 所在的行号（只算一次也行，这里直接算）
+        rows_to_hide = set()
+
+        for w in [
+            self.lineEdit_15, self.lineEdit_13, self.lineEdit_18,  # A2
+            self.lineEdit_25, self.lineEdit_34, self.lineEdit_35   # τ2
+        ]:
+            idx = layout.indexOf(w)
+            if idx >= 0:
+                row, col, rowspan, colspan = layout.getItemPosition(idx)
+                rows_to_hide.add(row)
+
+        if model == '单指数':
+            for row in rows_to_hide:
+                layout.setRowVisible(row, False)
+
+            # 清空双指数参数，防止残留
+            for le in [
+                self.lineEdit_15, self.lineEdit_13, self.lineEdit_18,
+                self.lineEdit_25, self.lineEdit_34, self.lineEdit_35
+            ]:
+                le.clear()
+
+        elif model == '双指数':
+            for row in rows_to_hide:
+                layout.setRowVisible(row, True)
+
+
+
+    def _perform_fitting(self, data, file_path):
+        """执行拟合计算的内部方法（支持自动初始值 + UI 约束）"""
+        try:
+            task = self._build_fit_task(data, file_path)
+            if task is None:
+                return
+            fit_output = run_fit_task(task)
+            self._apply_fit_output(fit_output)
+
         except Exception as e:
             error_msg = f"拟合计算时出错: {str(e)}"
             print(error_msg)
             traceback.print_exc()
             QMessageBox.critical(self, "错误", error_msg)
+
 
     def _setup_fitter_options(self, fitter):
         """设置拟合器选项"""
@@ -1948,18 +4004,37 @@ class mainWindow(QMainWindow, main_window):
             print(f"设置拟合器选项时出错: {str(e)}")
             return fitter
 
-    def _handle_fit_result(self, result, models_to_test, Origional_x, Origional_y_data, x, y_data, fitter):
+    def _calculate_double_exp_average_lifetime(self, params):
+        """计算双指数平均寿命: (A1*t1^2 + A2*t2^2) / (A1*t1 + A2*t2)。"""
+        try:
+            if params is None or len(params) < 4:
+                return None
+            a, t1, c, t2 = [float(v) for v in params[:4]]
+            denominator = a * t1 + c * t2
+            if denominator == 0:
+                return None
+            return (a * (t1 ** 2) + c * (t2 ** 2)) / denominator
+        except Exception:
+            return None
+
+    def _handle_fit_result(self, result, models_to_test, x_for_display, y_for_display, x_for_fitting, y_for_fitting, fitter):
         """处理拟合结果"""
         try:
             # 确保模型类型信息被保存
             self.current_model_type = models_to_test
             
             if models_to_test == '单指数':
-                b = result.params[1]
-                lifetime = -1/b if b != 0 else float('inf')
+                a, b, c = result.params
+                lifetime = b if b != 0 else float('inf')
                 self.lifetime = lifetime
-                self.lineEdit.setText(f"{lifetime:.8f}")
-                print(f"单指数拟合结果: lifetime = {lifetime:.6f}")
+                self.lineEdit_27.setText(f"{a:.5e}")   # A1
+                self.lineEdit.setText(f"{lifetime * self.tau_unit_11:.5e}")  # τ1（按单位显示）
+                self.lineEdit_29.setText(f"{c:.5e}")   # I0
+                self.lineEdit_26.clear()               # A2
+                self.lineEdit_28.clear()               # τ2
+                if hasattr(self, 'lineEdit_avg_lifetime'):
+                    self.lineEdit_avg_lifetime.clear()
+                print(f"单指数拟合结果: lifetime = {lifetime:.5e}")
 
             elif models_to_test == '双指数':
                 # 修复参数排序逻辑，确保 t1 < t2
@@ -1970,33 +4045,46 @@ class mainWindow(QMainWindow, main_window):
                     # 交换快速分量和慢速分量
                     a, c = c, a  # 交换振幅
                     t1, t2 = t2, t1  # 交换时间常数
-                    print(f"参数已交换: t1={t1:.6f}, t2={t2:.6f}")
+                    print(f"参数已交换: t1={t1:.5e}, t2={t2:.5e}")
                 
                 # 更新界面显示（确保 t1 < t2）
                 self.lineEdit_27.setText(f"{a:.5e}")  # 快速分量振幅
-                self.lineEdit.setText(f"{t1:.5e}")    # 快速衰减时间常数 (t1)
+                self.lineEdit.setText(f"{t1 * self.tau_unit_11:.5e}")    # 快速衰减时间常数 (t1, 按单位显示)
                 self.lineEdit_26.setText(f"{c:.5e}")  # 慢速分量振幅
-                self.lineEdit_28.setText(f"{t2:.5e}") # 慢速衰减时间常数 (t2)
+                self.lineEdit_28.setText(f"{t2 * self.tau_unit_12:.5e}") # 慢速衰减时间常数 (t2, 按单位显示)
                 self.lineEdit_29.setText(f"{e:.5e}")  # 基线
                 
                 # 同时更新result.params以确保保存时使用正确的顺序
                 result.params = [a, t1, c, t2, e]
+
+                avg_lifetime = self._calculate_double_exp_average_lifetime(result.params)
+                if avg_lifetime is not None and hasattr(self, 'lineEdit_avg_lifetime'):
+                    self.lineEdit_avg_lifetime.setText(f"{avg_lifetime * self.tau_unit_11:.5e}")
                 
                 print(f"双指数拟合结果: t1 = {t1:.5e}, t2 = {t2:.5e}, 振幅1 = {a:.5e}, 振幅2 = {c:.5e}")
+                if avg_lifetime is not None:
+                    print(f"双指数平均寿命 = {avg_lifetime:.5e}")
 
             # 更新统计信息
-            self.lineEdit_30.setText(f"{result.sse:.5e}")
-            self.lineEdit_7.setText(f"{result.rsquare:.5e}")
-            self.lineEdit_31.setText(f"{result.adjrsquare:.5e}")
-            self.lineEdit_32.setText(f"{result.rmse:.5e}")
+            self.lineEdit_30.setText(f"{result.sse:.5f}")
+            self.lineEdit_7.setText(f"{result.rsquare:.5f}")
+            self.lineEdit_31.setText(f"{result.adjrsquare:.5f}")
+            self.lineEdit_32.setText(f"{result.rmse:.5f}")
             self.lineEdit_33.setText(f"{'是' if result.success else '否'}")
 
-            # 绘制结果 - 保持原有绘图逻辑
+            # 绘制结果 - 拟合曲线只覆盖最终参与拟合的数据范围
             model_def = fitter._get_model_definition(models_to_test)
             if model_def:
-                # 使用原始的参数顺序进行绘图，不应用交换
-                y_pred = model_def['function'](x, *result.params)
-                self.fig1fig2_plot(Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test)
+                y_pred_fit = model_def['function'](x_for_fitting, *result.params)
+                self.fig1fig2_plot(
+                    x_for_display,
+                    y_for_display,
+                    x_for_fitting,
+                    y_for_fitting,
+                    y_pred_fit,
+                    models_to_test,
+                    x_for_fitting
+                )
             
             print("拟合完成:", result)
             
@@ -2005,19 +4093,28 @@ class mainWindow(QMainWindow, main_window):
             print(error_msg)
             traceback.print_exc()
 
-    def fig1fig2_plot(self, Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test):
-        """绘制拟合结果图形"""
+    def fig1fig2_plot(self, Origional_x, Origional_y_data, x, y_data, y_pred, models_to_test, x_pred=None):
+        """绘制拟合结果图形
+        
+        参数:
+            x_pred: 用于绘制拟合曲线的x坐标（如果为None，使用x）
+        """
         try:
+            # 如果没有提供x_pred，则使用拟合数据的x坐标
+            if x_pred is None:
+                x_pred = x
+            
             # 绘制图形
             self.figure2.clear()
             ax2 = self.figure2.add_subplot(111)
 
-            # 绘制所有数据点
-            ax2.scatter(Origional_x, Origional_y_data, alpha=0.3, color='gray', s=5)
+            # 绘制所有原始数据点
+            ax2.scatter(Origional_x, Origional_y_data, alpha=0.3, color='gray', s=5, label='原始数据')
             # 高亮显示用于拟合的数据点
-            ax2.scatter(x, y_data, alpha=0.8, color='blue', s=10)
+            ax2.scatter(x, y_data, alpha=0.8, color='blue', s=10, label='拟合范围数据')
             
-            ax2.plot(x, y_pred, 'r-', label=f'{models_to_test}拟合', linewidth=2)
+            # 绘制最终拟合范围内的拟合曲线
+            ax2.plot(x_pred, y_pred, 'r-', label=f'{models_to_test}拟合', linewidth=2)
             ax2.legend()
             ax2.set_title(f'{models_to_test}模型拟合结果')
             ax2.set_xlabel('时间')
@@ -2028,7 +4125,7 @@ class mainWindow(QMainWindow, main_window):
             self.figure2.tight_layout()
             self.canvas2.draw()
 
-            # 绘制残差
+            # 绘制残差（仅在拟合范围内）
             self.figure3.clear()
             ax3 = self.figure3.add_subplot(111)
             
@@ -2046,41 +4143,217 @@ class mainWindow(QMainWindow, main_window):
             self.calculate_lifetime()
         except Exception as e:
             print(f"绘图时出错: {str(e)}")
+
+    def _is_start_point_empty(self, model):
+        """判断初始值输入框是否全空（避免覆盖用户手动输入）"""
+        if model == '双指数':
+            edits = [self.lineEdit_6, self.lineEdit_14, self.lineEdit_15, self.lineEdit_25, self.lineEdit_36]
+        elif model == '单指数':
+            # 单指数参数：a, b(τ), c(I0) —— 你按你UI实际对应改一下
+            edits = [self.lineEdit_6, self.lineEdit_14, self.lineEdit_36]
+        else:
+            return True
+        return all(le.text().strip() == "" for le in edits)
+
+    def _should_update_start_point(self, current_start, smart_start, x, y):
+        """判断是否应该更新初始值 - 在切换文件时更积极地更新"""
+        # 如果UI为空，总是更新
+        if all(v is None for v in current_start):
+            return True
+
+        # 如果智能初始值明显更好，建议更新
+        try:
+            # 计算当前初始值的"合理性"评分
+            current_score = self._evaluate_start_point_quality(current_start, x, y)
+            smart_score = self._evaluate_start_point_quality(smart_start, x, y)
+
+            # 如果智能初始值明显更好（评分差距>10%，比原来更敏感），更新
+            if smart_score > current_score * 1.1:
+                return True
+
+            # 如果当前初始值包含不合理的参数（负值、极小值等），更新
+            for val in current_start:
+                if val is not None and (val <= 0 or val < 1e-8):
+                    return True
+
+            # 切换文件时，如果参数差异较大，也更新
+            # 检查参数差异 - 进一步降低阈值以更敏感地检测变化
+            significant_diff = False
+            for curr, smart in zip(current_start, smart_start):
+                if curr is not None and smart is not None:
+                    # 如果参数差异超过20%（进一步降低阈值），认为需要更新
+                    if abs(curr - smart) / max(abs(smart), 1e-10) > 0.2:
+                        significant_diff = True
+                        break
+
+            if significant_diff:
+                return True
+
+        except:
+            # 如果评估失败，保守起见更新
+            return True
+
+        return False
+
+    def _evaluate_start_point_quality(self, start_point, x, y):
+        """评估初始值的质量（基于物理合理性和数据匹配度）"""
+        if not start_point or all(v is None for v in start_point):
+            return 0
+
+        score = 0
+        try:
+            # 基本合理性检查
+            for val in start_point:
+                if val is not None:
+                    if val > 0 and val < 1e10:  # 合理范围
+                        score += 10
+                    elif val <= 0:  # 负值或零
+                        score -= 50
+
+            # 数据范围匹配度
+            y_range = np.max(y) - np.min(y)
+            x_range = x[-1] - x[0]
+
+            # 检查振幅参数是否在合理范围内
+            if len(start_point) >= 3:  # 单指数或双指数
+                amplitude_params = [start_point[0]]  # 第一个参数通常是振幅
+                if len(start_point) >= 5:  # 双指数
+                    amplitude_params.append(start_point[2])  # 第二个振幅
+
+                for amp in amplitude_params:
+                    if amp is not None:
+                        if 0.1 * y_range <= amp <= 5 * y_range:
+                            score += 20
+                        elif amp < 0.01 * y_range or amp > 10 * y_range:
+                            score -= 30
+
+            # 检查时间常数是否在合理范围内
+            time_params = []
+            if len(start_point) == 3:  # 单指数: [amp, tau, baseline]
+                if start_point[1] is not None and start_point[1] > 0:
+                    tau = start_point[1]  # tau 直接就是第二个参数
+                    time_params.append(tau)
+            elif len(start_point) == 5:  # 双指数: [amp1, tau1, amp2, tau2, baseline]
+                time_params.extend([start_point[1], start_point[3]])  # tau1, tau2
+
+            for tau in time_params:
+                if tau is not None:
+                    if 0.001 * x_range <= tau <= 10 * x_range:
+                        score += 15
+                    elif tau < 0.0001 * x_range or tau > 100 * x_range:
+                        score -= 25
+
+        except:
+            score -= 10  # 评估出错，降低评分
+
+        return max(0, score)  # 确保评分不为负
+
+    def reset_start_point(self):
+        """重置初始值为智能推荐值"""
+        try:
+            # 获取当前数据
+            if not hasattr(self, 'current_data') or self.current_data is None:
+                QMessageBox.warning(self, "警告", "请先加载数据文件")
+                return
             
+            # 获取筛选后的数据
+            data = self.current_data
+            Origional_x = data[:, 0]
+            Origional_y_data = data[:, 1]
+            x, y_data = self.data_range(Origional_x, Origional_y_data)
+            
+            if len(x) < 2:
+                QMessageBox.warning(self, "警告", "筛选后的数据点不足")
+                return
+            
+            # 获取当前模型
+            model = self.comboBox.currentText()
+            
+            # 创建拟合器并计算智能初始值
+            fitter = MATLABCurveFitter()
+            fitter = self._setup_fitter_options(fitter)
+            smart_p0 = fitter._get_default_start_point(model, x, y_data)
+            
+            # 填充到UI
+            self._auto_fill_start_point(model, smart_p0)
+            
+            QMessageBox.information(self, "成功", f"已重置{model}模型的初始值为智能推荐值")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"重置初始值失败: {str(e)}")
+
+    def _read_param_block(self, edits):
+        """读取一组 lineEdit，支持 inf / -inf / 空"""
+        vals = []
+        for le in edits:
+            text = le.text().strip()
+            if text == "":
+                vals.append(None)
+            elif text.lower() == "inf":
+                vals.append(np.inf)
+            elif text.lower() == "-inf":
+                vals.append(-np.inf)
+            else:
+                try:
+                    vals.append(float(text))
+                except ValueError:
+                    vals.append(None)
+        return vals
+
+    def _auto_fill_start_point(self, model, p0):
+        """把自动初始值写回UI（只负责写初始值，不管上下限）"""
+        if model == '双指数' and len(p0) >= 5:
+            # 使用5位科学计数法显示
+            self.lineEdit_6.setText(f"{p0[0]:.5e}")   # A1
+            self.lineEdit_14.setText(f"{p0[1]:.5e}")  # τ1
+            self.lineEdit_15.setText(f"{p0[2]:.5e}")  # A2
+            self.lineEdit_25.setText(f"{p0[3]:.5e}")  # τ2
+            self.lineEdit_36.setText(f"{p0[4]:.5e}")  # I0
+        elif model == '单指数' and len(p0) >= 3:
+            self.lineEdit_6.setText(f"{p0[0]:.5e}")   # A
+            self.lineEdit_14.setText(f"{p0[1]:.5e}")  # τ 或 b
+            self.lineEdit_36.setText(f"{p0[2]:.5e}")  # I0
+
     def calculate_lifetime(self):
         """使用线性插值和两侧外推方法计算温度，基于平均寿命"""
         try:
             # 检查是否有拟合结果
             if self.result is None or not self.result.success:
-                QMessageBox.warning(self, "警告", "请先进行成功的拟合计算")
+                self.textEdit.setText("警告：请先进行成功的拟合计算")
+                self._clear_oxidation_metrics()
                 return
             
             # 检查标定数据（修改为检查是否为空列表）
             if not hasattr(self, 'temperature_calibration') or not self.temperature_calibration:
-                QMessageBox.warning(self, "警告", "请先导入标定数据")
+                self.textEdit.setText("警告：未设置温度标定数据")
+                self._clear_oxidation_metrics()
                 return
             
             if not hasattr(self, 'lifetime_calibration') or not self.lifetime_calibration:
-                QMessageBox.warning(self, "警告", "请先导入标定数据")
+                self.textEdit.setText("警告：未设置寿命标定数据")
+                self._clear_oxidation_metrics()
                 return
             
             # 计算平均寿命
             avg_lifetime = self.calculate_average_lifetime()
             if avg_lifetime is None:
-                QMessageBox.warning(self, "警告", "无法计算平均寿命")
+                self.textEdit.setText("警告：无法计算平均寿命")
+                self._clear_oxidation_metrics()
                 return
             
             # 使用线性插值和两侧外推计算温度（这会设置self.temperature）
             temperature = self.calculate_temperature_by_interpolation(avg_lifetime)
             if temperature is None:
-                QMessageBox.warning(self, "警告", "温度计算失败")
+                self.textEdit.setText("警告：温度计算失败")
+                self._clear_oxidation_metrics()
                 return
             
             # 显示结果
             self.display_temperature_result(temperature, avg_lifetime)
             
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"计算寿命温度时出错: {str(e)}")
+            self.textEdit.setText(f"计算寿命温度时出错: {str(e)}")
+            self._clear_oxidation_metrics()
             traceback.print_exc()
 
     def calculate_average_lifetime(self):
@@ -2185,7 +4458,7 @@ class mainWindow(QMainWindow, main_window):
             # 构建显示文本
             result_text = f"""
             <div align="center">
-                <font color="red" size="9">{temperature:.2f} ℃</font>
+                <span style="font-size:36pt; font-weight:600; color:#aa0000;">{temperature:.2f} ℃</span>
             </div>
             """
             
@@ -2197,11 +4470,65 @@ class mainWindow(QMainWindow, main_window):
             print(f"  平均寿命: {avg_lifetime:.6f}")
             print(f"  计算温度: {temperature:.2f} °C")
             print(f"  拟合优度 R²: {self.result.rsquare:.4f}")
+            self.update_oxidation_metrics()
             
         except Exception as e:
             print(f"显示温度结果时出错: {str(e)}")
             # 如果出错，至少显示温度值
-            self.textEdit.setHtml(f'<div align="center"><font color="red" size="9">{temperature:.2f} ℃</font></div>')
+            self.textEdit.setHtml(
+                f'<div align="center"><span style="font-size:36pt; font-weight:600; color:#aa0000;">{temperature:.2f} ℃</span></div>'
+            )
+            self.update_oxidation_metrics()
+
+    def _on_oxidation_time_changed(self):
+        """时间输入变化后，尝试刷新氧化参数。"""
+        self.update_oxidation_metrics()
+
+    def _clear_oxidation_metrics(self):
+        """清空氧化参数显示。"""
+        self.lineEdit_40.clear()
+        self.lineEdit_41.clear()
+        self.lineEdit_42.clear()
+
+    def update_oxidation_metrics(self):
+        """
+        根据拟合温度和输入时间计算：
+        厚度(um) = 4.18*10E-4*T(K)*(0.44+ln(t_h))
+        速率(um/h) = 厚度 / t_h
+        孔隙率(%) = -3.58*10E-4*T(K)*(31+ln(t_h)) + 30
+        """
+        try:
+            temp_c = getattr(self, 'temperature', None)
+            time_text = self.lineEdit_39.text().strip()
+
+            if temp_c is None or time_text == "":
+                self._clear_oxidation_metrics()
+                return
+
+            try:
+                time_h = float(time_text)
+            except ValueError:
+                self._clear_oxidation_metrics()
+                return
+
+            if time_h <= 0:
+                self._clear_oxidation_metrics()
+                return
+
+            temp_k = float(temp_c) + 273.15
+            ln_time = np.log(time_h)
+
+            thickness_um = 4.18 * 10**-4 * temp_k * (0.44 + ln_time)
+            oxidation_rate = thickness_um / time_h
+            porosity = -3.58 * 10**-4 * temp_k * (31 + ln_time) + 30
+
+            self.lineEdit_40.setText(f"{thickness_um:.2f}")
+            self.lineEdit_41.setText(f"{oxidation_rate:.2f}")
+            self.lineEdit_42.setText(f"{porosity:.2f}")
+
+        except Exception as e:
+            print(f"更新氧化参数时出错: {str(e)}")
+            self._clear_oxidation_metrics()
     
     def validate_folder_path(self, path):
         """验证文件夹路径是否有效"""
@@ -2214,6 +4541,9 @@ class mainWindow(QMainWindow, main_window):
 
     def cleanup(self):
         """清理资源"""
+        if self._fit_thread and self._fit_thread.isRunning():
+            self._fit_thread.quit()
+            self._fit_thread.wait(1500)
         self.file_data_cache.clear()
         self.clear_figures()
         self.save_current_settings()
@@ -2229,6 +4559,7 @@ class mainWindow(QMainWindow, main_window):
 
 if __name__ == '__main__':
     try:
+        multiprocessing.freeze_support()
         QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
         app = QApplication(sys.argv)
         myWin = mainWindow()
