@@ -7,6 +7,7 @@ import PyQt5.QtCore as QtCore
 from PyQt5.QtCore import QTimer, QCoreApplication, pyqtSignal, QObject, QDir, QSettings
 from PyQt5.QtGui import QImage, QPixmap, QFont, QCursor
 from info_window import Ui_MainWindow as main_window
+from fit_window_validator import FitWindowValidatorDialog
 import os
 
 for _thread_env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -1516,6 +1517,52 @@ def _batch_average_lifetime(model, params):
         return None
     return None
 
+def run_fit_window_scan_worker(args):
+    """按主界面拟合流程扫描单个开始/结束时间窗口。"""
+    base_task, start_time, end_time = args
+    x_base = np.asarray(base_task["x_for_fitting"], dtype=float)
+    y_base = np.asarray(base_task["y_for_fitting"], dtype=float)
+    model = base_task.get("model", "")
+    min_points = max(len(base_task.get("start") or []), 3)
+
+    mask = (x_base >= start_time) & (x_base <= end_time)
+    if int(np.count_nonzero(mask)) < min_points:
+        return {
+            "start": start_time,
+            "end": end_time,
+            "lifetime": np.nan,
+            "success": False,
+            "message": "数据点不足",
+        }
+
+    x_fit = x_base[mask]
+    y_fit = y_base[mask]
+    task = dict(base_task)
+    task["x_for_fitting"] = x_fit
+    task["y_for_fitting"] = y_fit
+
+    # Keep every fitting option (including StartPoint) exactly as prepared by
+    # the main window.  The validator only changes the selected data window.
+    output = run_fit_task(task)
+    result = output.get("result")
+    lifetime = _batch_average_lifetime(model, getattr(result, "params", None))
+    success = bool(result is not None and result.success and lifetime is not None and np.isfinite(lifetime))
+    return {
+        "start": start_time,
+        "end": end_time,
+        "lifetime": lifetime if success else np.nan,
+        "success": success,
+        "message": getattr(result, "message", "") if result is not None else "",
+        "file_name": os.path.basename(base_task.get("file_path", "")),
+        "model_type": model,
+        "params": list(result.params) if result is not None and result.params is not None else [],
+        "param_names": list(result.param_names) if result is not None and result.param_names is not None else [],
+        "sse": getattr(result, "sse", np.nan) if result is not None else np.nan,
+        "rsquare": getattr(result, "rsquare", np.nan) if result is not None else np.nan,
+        "adjrsquare": getattr(result, "adjrsquare", np.nan) if result is not None else np.nan,
+        "rmse": getattr(result, "rmse", np.nan) if result is not None else np.nan,
+    }
+
 def _batch_temperature_by_interpolation(lifetime, temperatures, lifetimes):
     if lifetime is None or not temperatures or not lifetimes:
         return None
@@ -2030,6 +2077,7 @@ class mainWindow(QMainWindow, main_window):
         self.treeWidget.setHeaderLabels(["文件列表"])
         self.treeWidget.setColumnCount(1)
         self._initialize_fit_window_controls()
+        self._initialize_data_selection_controls()
 
         # 完全隐藏氧化参数区域
         self._hide_oxidation_section()
@@ -2041,6 +2089,19 @@ class mainWindow(QMainWindow, main_window):
         
         # 初始化matplotlib图形
         self._setup_matplotlib_canvases()
+
+    def _initialize_data_selection_controls(self):
+        """在数据选择页增加拟合窗验证入口。"""
+        if hasattr(self, 'pushButton_fit_window_validate'):
+            return
+
+        self.pushButton_fit_window_validate = QtWidgets.QPushButton("拟合窗验证", self.page)
+        self.pushButton_fit_window_validate.setObjectName("pushButton_fit_window_validate")
+        self.pushButton_fit_window_validate.setToolTip(
+            "使用当前选中文件和筛选/拟合设置生成拟合窗口诊断图，不覆盖主界面拟合结果。"
+        )
+        self.pushButton_fit_window_validate.clicked.connect(self.open_fit_window_validation)
+        self.gridLayout_9.addWidget(self.pushButton_fit_window_validate, 3, 0, 1, 5)
 
     def _hide_oxidation_section(self):
         """完全隐藏氧化参数相关控件。"""
@@ -2387,6 +2448,30 @@ class mainWindow(QMainWindow, main_window):
         item.setData(0, QtCore.Qt.UserRole, file_path)
         return item
 
+    def _get_work_directory(self):
+        """返回当前有效工作文件夹。"""
+        work_dir = self.pushButton.text().strip()
+        return work_dir if work_dir and os.path.isdir(work_dir) else ""
+
+    def _get_download_directory(self):
+        """返回当前有效保存文件夹。"""
+        download_dir = self.pushButton_3.text().strip()
+        if download_dir and os.path.isdir(download_dir):
+            return download_dir
+        work_dir = self._get_work_directory()
+        return work_dir if work_dir else ""
+
+    def _get_work_directory_csv_files(self):
+        """返回工作文件夹内的CSV文件。"""
+        work_dir = self._get_work_directory()
+        if not work_dir:
+            return []
+        return sorted(
+            os.path.join(work_dir, name)
+            for name in os.listdir(work_dir)
+            if name.lower().endswith(".csv") and os.path.isfile(os.path.join(work_dir, name))
+        )
+
     def setup_matplotlib_chinese(self):
         """配置matplotlib支持中文显示"""
         # 设置中文字体
@@ -2500,6 +2585,8 @@ class mainWindow(QMainWindow, main_window):
         last_download_dir = self.settings.value("last_download_directory", "")
         if last_download_dir and os.path.exists(last_download_dir):
             self.pushButton_3.setText(last_download_dir)
+        elif last_work_dir and os.path.exists(last_work_dir):
+            self.pushButton_3.setText(last_work_dir)
         last_img_dir = self.settings.value("last_img_directory", "")
         batch_workers = self.settings.value("batch_workers", "")
         if batch_workers and hasattr(self, 'lineEdit_batch_workers'):
@@ -2546,7 +2633,27 @@ class mainWindow(QMainWindow, main_window):
     def set_download_directory(self):
         """打开文件夹选择对话框并更新lineEdit内容"""
         try:
-            initial_dir = self.pushButton_3.text() or QDir.homePath()
+            work_dir = self._get_work_directory()
+            if work_dir:
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("设置数据保存路径")
+                msg_box.setText("请选择数据保存路径")
+                use_work_dir_button = msg_box.addButton("使用工作文件夹", QMessageBox.AcceptRole)
+                choose_button = msg_box.addButton("选择其他文件夹", QMessageBox.ActionRole)
+                msg_box.addButton(QMessageBox.Cancel)
+                msg_box.setDefaultButton(use_work_dir_button)
+                msg_box.exec_()
+
+                clicked_button = msg_box.clickedButton()
+                if clicked_button == use_work_dir_button:
+                    self.pushButton_3.setText(work_dir)
+                    self.download_directory = work_dir
+                    self.save_current_settings()
+                    return
+                if clicked_button != choose_button:
+                    return
+
+            initial_dir = self._get_download_directory() or work_dir or QDir.homePath()
             folder_path = QFileDialog.getExistingDirectory(
                 self,
                 "选择数据保存路径",
@@ -2564,7 +2671,7 @@ class mainWindow(QMainWindow, main_window):
                 else:
                     print("警告：路径不可访问")
             
-            self.download_directory = self.pushButton_3.text()
+            self.download_directory = self._get_download_directory()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"设置保存目录时出错:\n{str(e)}")
 
@@ -2595,10 +2702,10 @@ class mainWindow(QMainWindow, main_window):
         """保存当前的工作路径和文件列表到设置"""
         try:
             # 保存工作路径
-            work_dir = self.pushButton.text()
+            work_dir = self._get_work_directory()
             if work_dir and os.path.exists(work_dir):
                 self.settings.setValue("last_work_directory", work_dir)
-            download_dir = self.pushButton_3.text()
+            download_dir = self._get_download_directory()
             if download_dir and os.path.exists(download_dir):
                 self.settings.setValue("last_download_directory", download_dir)        
 
@@ -2631,6 +2738,8 @@ class mainWindow(QMainWindow, main_window):
     def set_work_directory(self):
         """打开文件夹选择对话框并更新lineEdit内容"""
         try:
+            previous_work_dir = self._get_work_directory()
+            previous_download_dir = self._get_download_directory()
             initial_dir = self.pushButton.text() or QDir.homePath()
             
             folder_path = QFileDialog.getExistingDirectory(
@@ -2644,6 +2753,9 @@ class mainWindow(QMainWindow, main_window):
                 self.pushButton.setText(folder_path)
                 if self.validate_folder_path(folder_path):
                     print(f"有效路径: {folder_path}")
+                    if not previous_download_dir or previous_download_dir == previous_work_dir:
+                        self.pushButton_3.setText(folder_path)
+                        self.download_directory = folder_path
                     # 保存设置
                     self.save_current_settings()
                 else:
@@ -2662,7 +2774,7 @@ class mainWindow(QMainWindow, main_window):
                 return
             
             # 检查保存目录是否设置
-            self.download_directory = self.pushButton_3.text()
+            self.download_directory = self._get_download_directory()
 
             if not self.download_directory or not os.path.exists(self.download_directory):
                 QMessageBox.warning(self, "警告", "请先设置有效的保存目录")
@@ -2922,7 +3034,7 @@ class mainWindow(QMainWindow, main_window):
                 return
             
             # 检查保存目录是否设置
-            self.download_directory = self.pushButton_3.text()
+            self.download_directory = self._get_download_directory()
 
             if not self.download_directory or not os.path.exists(self.download_directory):
                 QMessageBox.warning(self, "警告", "请先设置有效的保存目录")
@@ -3168,14 +3280,37 @@ class mainWindow(QMainWindow, main_window):
     def select_target_files(self):
         """打开文件选择对话框，选择Excel/TXT/CSV文件并添加到treeWidget"""
         try:
-            initial_dir = self.pushButton.text() if self.pushButton.text() else QDir.homePath()
+            work_dir = self._get_work_directory()
+            file_paths = []
+
+            if work_dir:
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("选择目标文件")
+                msg_box.setText("请选择目标文件来源")
+                use_csv_button = msg_box.addButton("工作文件夹内所有CSV", QMessageBox.AcceptRole)
+                choose_button = msg_box.addButton("手动选择文件", QMessageBox.ActionRole)
+                msg_box.addButton(QMessageBox.Cancel)
+                msg_box.setDefaultButton(use_csv_button)
+                msg_box.exec_()
+
+                clicked_button = msg_box.clickedButton()
+                if clicked_button == use_csv_button:
+                    file_paths = self._get_work_directory_csv_files()
+                    if not file_paths:
+                        QMessageBox.warning(self, "警告", "工作文件夹内没有CSV文件")
+                        return
+                elif clicked_button != choose_button:
+                    return
+
+            initial_dir = work_dir or QDir.homePath()
             
-            file_paths, _ = QFileDialog.getOpenFileNames(
-                self,
-                "选择目标文件",
-                initial_dir,
-                self._get_file_filters()
-            )
+            if not file_paths:
+                file_paths, _ = QFileDialog.getOpenFileNames(
+                    self,
+                    "选择目标文件",
+                    initial_dir,
+                    self._get_file_filters()
+                )
             
             if file_paths:
                 # 清空现有内容（可选，根据需要决定是否保留之前的内容）
@@ -3195,6 +3330,79 @@ class mainWindow(QMainWindow, main_window):
                 self.save_current_settings()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"选择文件时出错:\n{str(e)}")
+
+    def open_fit_window_validation(self):
+        """打开当前文件的拟合窗验证窗口。"""
+        try:
+            current_item = self.treeWidget.currentItem()
+            if current_item is None:
+                QMessageBox.warning(self, "警告", "请先选择一个目标文件")
+                return
+
+            file_path = current_item.data(0, QtCore.Qt.UserRole)
+            if not file_path or not os.path.exists(file_path):
+                QMessageBox.warning(self, "警告", "当前目标文件不存在")
+                return
+
+            if file_path in self.file_data_cache:
+                data = self.file_data_cache[file_path]
+            else:
+                if not self.load_file_data(file_path):
+                    QMessageBox.warning(self, "错误", f"无法加载文件数据: {os.path.basename(file_path)}")
+                    return
+                data = self.file_data_cache[file_path]
+
+            task = self._build_fit_task(data, file_path)
+            if task is None:
+                return
+            task["fit_window_scan_defaults"] = self._get_fit_window_scan_defaults(task)
+
+            self.fit_window_validation_dialog = FitWindowValidatorDialog(self, task, run_fit_window_scan_worker)
+            self.fit_window_validation_dialog.exec_()
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"拟合窗验证时出错:\n{str(e)}")
+            traceback.print_exc()
+
+    def _get_fit_window_scan_defaults(self, task):
+        """使用当前主界面时间参数作为拟合窗扫描默认值。"""
+        x = np.asarray(task.get("x_for_fitting", []), dtype=float)
+        if len(x) == 0:
+            return {}
+
+        x_min = float(np.min(x))
+        x_max = float(np.max(x))
+        span = max(x_max - x_min, np.finfo(float).eps)
+        start_unit = self.comboBox_5.currentText()
+        end_unit = self.comboBox_6.currentText()
+        start_text = self.lineEdit_2.text().strip()
+        end_text = self.lineEdit_5.text().strip()
+
+        defaults = {
+            "start_min": x_min,
+            "start_max": x_max,
+            "start_step": span / 20.0,
+            "start_unit": start_unit,
+            "end_min": x_min,
+            "end_max": x_max,
+            "end_step": span / 20.0,
+            "end_unit": end_unit,
+            "output_dir": self._get_download_directory(),
+        }
+
+        try:
+            if start_text:
+                defaults["start_min"] = float(start_text) / float(UNIT_MAPPING[start_unit])
+        except ValueError:
+            pass
+
+        try:
+            if end_text:
+                defaults["end_max"] = float(end_text) / float(UNIT_MAPPING[end_unit])
+        except ValueError:
+            pass
+
+        return defaults
         
     def _load_excel_data(self, file_path, column1, column2, data_start_row=None):
         """加载Excel数据"""
